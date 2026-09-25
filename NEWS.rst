@@ -2,6 +2,21 @@
   :copyright: SPDX-FileCopyrightText: Christian Amsüss
   :copyright: SPDX-License-Identifier: MIT
 
+Version 0.4.18
+--------------
+
+Enhancements
+~~~~~~~~~~~~
+
+* Blockwise transfers now use RFC9175 Request-Tag options.
+
+  The client assigns a distinct tag to every blockwise operation
+  (keeping it constant across retransmissions and block size negotiations),
+  and the server distinguishes concurrent operations by the set of tags
+  rather than mistaking a later first block for a replacement of an earlier
+  operation. Tags already present on a request (eg. added by a proxy) are
+  preserved and forwarded.
+
 Version 0.4.17
 --------------
 

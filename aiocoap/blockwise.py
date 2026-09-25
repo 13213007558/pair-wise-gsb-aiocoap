@@ -19,6 +19,13 @@ def _extract_block_key(message):
     """Extract a key that hashes equally for all blocks of a blockwise
     operation from a request message.
 
+    With RFC9175 Request-Tag options, the client (and proxies on the path)
+    can make sure that this key is unique per operation even when the same
+    endpoint, code and options are used concurrently; the tags are evaluated
+    as a set, so their order does not matter. Note that the token is
+    deliberately not part of the key: it identifies individual exchanges, not
+    the operation's whole body.
+
     See discussion at <https://mailarchive.ietf.org/arch/msg/core/I-6LzAL6lIUVDA6_g9YM3Zjhg8E>.
     """
 
@@ -30,8 +37,10 @@ def _extract_block_key(message):
                 OptionNumber.BLOCK1,
                 OptionNumber.BLOCK2,
                 OptionNumber.OBSERVE,
+                OptionNumber.REQUEST_TAG,
             ]
         ),
+        frozenset(message.opt.request_tag),
     )
 
 

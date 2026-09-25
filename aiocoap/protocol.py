@@ -50,6 +50,7 @@ user has write access to the aiocoap source code.
 import asyncio
 import weakref
 import time
+import os
 
 from .credentials import CredentialsMap
 from .message import Message
@@ -900,6 +901,13 @@ class BlockwiseRequest(BaseUnicastRequest, interfaces.Request):
         # is responsible for updating this number.
         block_cursor = 0
 
+        # RFC9175 Request-Tag identifying this blockwise operation. It is
+        # generated lazily when the first Block1 request is sent, and stays
+        # constant for the whole operation (across retransmissions and block
+        # size negotiations), so that a server can tell this operation apart
+        # from any concurrent one going to the same URI.
+        request_tag = None
+
         while True:
             # ... send a chunk
 
@@ -920,6 +928,17 @@ class BlockwiseRequest(BaseUnicastRequest, interfaces.Request):
                     current_block1.opt.size1 = len(app_request.payload)
             else:
                 current_block1 = app_request
+
+            if current_block1.opt.block1 is not None:
+                if request_tag is None:
+                    request_tag = os.urandom(4)
+                # Any tags already set on the request (eg. by a proxy that
+                # added its own when forwarding) are kept; ours is added to
+                # the set.
+                current_block1.opt.request_tag = (
+                    *current_block1.opt.request_tag,
+                    request_tag,
+                )
 
             blockrequest = protocol.request(current_block1, handle_blockwise=False)
             blockresponse = await blockrequest.response
@@ -1033,7 +1052,7 @@ class BlockwiseRequest(BaseUnicastRequest, interfaces.Request):
             future_weak_observation = protocol.loop.create_future()  # packing this up because its destroy callback needs to reference the subtask
             subtask = asyncio.create_task(
                 cls._run_observation(
-                    app_request,
+                    current_block1,
                     lower_observation,
                     future_weak_observation,
                     protocol,

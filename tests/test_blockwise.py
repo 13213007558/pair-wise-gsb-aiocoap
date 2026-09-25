@@ -7,7 +7,6 @@ are covered in test_server.TestServer.test_replacing_resource."""
 
 import asyncio
 
-import unittest
 import aiocoap
 import aiocoap.defaults
 
@@ -27,11 +26,26 @@ class BigChunkyResource(BigResource):
         return await super().render_get(request)
 
 
+class SpoolResource(aiocoap.resource.Resource):
+    """POST target that records the bodies (and Request-Tags) of all requests
+    that arrive completely assembled."""
+
+    def __init__(self):
+        super().__init__()
+        self.arrived = []
+
+    async def render_post(self, request):
+        self.arrived.append((request.payload, request.opt.request_tag))
+        return aiocoap.Message(code=aiocoap.CHANGED)
+
+
 class ChunkyTestingSite(BasicTestingSite):
     def __init__(self):
         super().__init__()
 
         self.add_resource(["big", "chunky"], BigChunkyResource())
+        self.spool = SpoolResource()
+        self.add_resource(["spool"], self.spool)
 
 
 class WithChunkyTestServer(WithTestServer):
@@ -39,8 +53,10 @@ class WithChunkyTestServer(WithTestServer):
 
 
 class TestBlockwise(WithChunkyTestServer, WithClient):
-    # tracked as https://github.com/chrysn/aiocoap/issues/58; behavior can be successful more or less by chance
-    @unittest.skip
+    def create_testing_site(self):
+        self.testingsite = super().create_testing_site()
+        return self.testingsite
+
     @no_warnings
     async def test_sequential(self):
         """Test whether the client serializes simultaneous block requests"""
@@ -72,6 +88,97 @@ class TestBlockwise(WithChunkyTestServer, WithClient):
 
         self.assertSetEqual(
             set(responses), set(x.replace(b"0", b"O") for x in (pattern1, pattern2))
+        )
+
+    @no_warnings
+    async def test_interleaved(self):
+        """Two equally long but different bodies are uploaded to the same
+        resource in interleaved Block1 transfers, with a retransmitted first
+        block and a block size reduction thrown in.
+
+        The Request-Tag mechanism (RFC9175) has to ensure that the resource
+        receives exactly the two original bodies and nothing mixed up, and
+        that a later operation that does not use Request-Tags still works."""
+
+        body1 = bytes(range(256)) * 8
+        body2 = bytes(reversed(range(256))) * 8
+
+        tag1 = b"op-one"
+        tag2 = b"op-two"
+
+        async def send_block(tag, number, more, size_exp, payload):
+            request = aiocoap.Message(
+                uri="coap://" + self.servernetloc + "/spool",
+                code=aiocoap.POST,
+                payload=payload,
+            )
+            request.opt.block1 = (number, more, size_exp)
+            if tag is not None:
+                request.opt.request_tag = (tag,)
+            response = await self.client.request(
+                request, handle_blockwise=False
+            ).response
+            if more:
+                self.assertEqual(
+                    response.code,
+                    aiocoap.CONTINUE,
+                    "Intermediate block not acknowledged with 2.31",
+                )
+            else:
+                self.assertEqual(
+                    response.code,
+                    aiocoap.CHANGED,
+                    "Final block not acknowledged with 2.04",
+                )
+            self.assertEqual(response.opt.block1.block_number, number)
+
+        # first blocks of both operations, ...
+        await send_block(tag1, 0, True, 6, body1[:1024])
+        await send_block(tag2, 0, True, 6, body2[:1024])
+        # ... a retransmission of the first block of the first operation, ...
+        await send_block(tag1, 0, True, 6, body1[:1024])
+        # ... completion of the second operation, ...
+        await send_block(tag2, 1, False, 6, body2[1024:])
+        # ... and completion of the first operation at a re-negotiated
+        # (reduced) block size.
+        await send_block(tag1, 4, True, 4, body1[1024:1280])
+        await send_block(tag1, 5, True, 4, body1[1280:1536])
+        await send_block(tag1, 6, True, 4, body1[1536:1792])
+        await send_block(tag1, 7, False, 4, body1[1792:])
+
+        # A sequential operation that does not use Request-Tags still works.
+        await send_block(None, 0, True, 6, body1[:1024])
+        await send_block(None, 1, False, 6, body1[1024:])
+
+        arrived = self.testingsite.spool.arrived
+        self.assertEqual(
+            [payload for payload, _tags in arrived],
+            [body2, body1, body1],
+            "Resource did not receive exactly the sent bodies",
+        )
+
+    @no_warnings
+    async def test_request_tag_forwarding(self):
+        """A request that already carries a Request-Tag (eg. because a proxy
+        added its own when forwarding) keeps that tag through the managed
+        blockwise transfer, and the client adds its own tag to the set."""
+
+        payload = b"0123456789----------" * 512
+        request = aiocoap.Message(
+            uri="coap://" + self.servernetloc + "/spool",
+            code=aiocoap.POST,
+            payload=payload,
+        )
+        request.opt.request_tag = (b"proxy-tag",)
+
+        response = await self.client.request(request).response
+        self.assertEqual(response.code, aiocoap.CHANGED)
+
+        ((arrived_payload, arrived_tags),) = self.testingsite.spool.arrived
+        self.assertEqual(arrived_payload, payload)
+        self.assertIn(b"proxy-tag", arrived_tags)
+        self.assertEqual(
+            len(arrived_tags), 2, "Client did not add its own Request-Tag"
         )
 
     @no_warnings
