@@ -31,6 +31,12 @@ class TokenManager(interfaces.RequestInterface, interfaces.TokenManager):
         self.log = self.context.log
         self.loop = self.context.loop
 
+        self._multicast_tokens = set()
+        """Tokens of outgoing requests made through :meth:`multicast_request`.
+
+        Responses to these are accepted from any remote, and no response is
+        final: the registration only ends when the requester loses interest."""
+
     def __repr__(self):
         return "<%s for %s>" % (
             type(self).__name__,
@@ -58,6 +64,7 @@ class TokenManager(interfaces.RequestInterface, interfaces.TokenManager):
             request = self.outgoing_requests.pop(key)
             request.add_exception(error.LibraryShutdown())
         self.outgoing_requests = None
+        self._multicast_tokens = None
 
         await self.token_interface.shutdown()
 
@@ -201,6 +208,12 @@ class TokenManager(interfaces.RequestInterface, interfaces.TokenManager):
             request.request.opt.observe == 0 and response.opt.observe is not None
         )
 
+        if response.token in self._multicast_tokens:
+            # A multicast request stays registered for more responses from
+            # any remote until the requester loses interest; no single
+            # response is final.
+            final = False
+
         if final:
             self.outgoing_requests.pop(key)
 
@@ -278,3 +291,58 @@ class TokenManager(interfaces.RequestInterface, interfaces.TokenManager):
             # keep an eye out for responses on that token and cancel
             # transmission accordingly.
             request.on_event(lambda ev: (send_canceller(), False)[1], is_interest=False)
+
+    def multicast_request(self, request):
+        """Service a multicast request: Send the request, and keep the token
+        registered for responses from any remote until the requester stops
+        indicating interest in the pipe (rather than until the first response
+        arrives, as :meth:`request` does)."""
+
+        if self.outgoing_requests is None:
+            request.add_exception(error.LibraryShutdown())
+            return
+
+        msg = request.request
+
+        assert msg.code.is_request(), "Message code is not valid for request"
+
+        # This might easily change, but right now, relying on the Context to
+        # fill_remote early makes steps easier here.
+        assert msg.remote is not None, "Remote not pre-populated"
+
+        if not msg.remote.is_multicast:
+            self.log.warning(
+                "Sending request to unicast address via multicast request method"
+            )
+
+        msg.token = self.next_token()
+
+        self.log.debug(
+            "Sending multicast request - Token: %s, Remote: %s",
+            msg.token.hex(),
+            msg.remote,
+        )
+
+        # Responses are accepted from any remote; the registration is keyed
+        # like the responses' fallback key in process_response.
+        key = (msg.token, None)
+        self.outgoing_requests[key] = request
+        self._multicast_tokens.add(msg.token)
+        request.on_interest_end(functools.partial(self._release_multicast, key))
+
+        try:
+            self.token_interface.send_message(
+                msg, lambda: request.add_exception(error.MessageError)
+            )
+        except Exception as e:
+            request.add_exception(e)
+            return
+
+    def _release_multicast(self, key):
+        """Drop all discovery state of a multicast request (called when the
+        requester loses interest, ie. typically when the discovery window
+        ends)."""
+        if self.outgoing_requests is not None:
+            self.outgoing_requests.pop(key, None)
+        if self._multicast_tokens is not None:
+            self._multicast_tokens.discard(key[0])

@@ -319,6 +319,20 @@ class RequestInterface(metaclass=abc.ABCMeta):
     def request(self, request: Pipe):
         pass
 
+    def multicast_request(self, request: Pipe):
+        """Send a request to a multicast address.
+
+        Unlike in :meth:`request`, the request is kept alive after the first
+        response comes in: responses from any responding endpoint are
+        accepted into the pipe (and none of them is indicated as the last)
+        until the requester stops indicating interest in the pipe.
+
+        The default implementation raises :class:`NotImplementedError`;
+        currently, only message-loss tolerant transports (ie. UDP through
+        the TokenManager) implement this.
+        """
+        raise NotImplementedError("This transport does not support multicast requests")
+
     @abc.abstractmethod
     async def recognize_remote(self, message):
         """Return True if the remote of this message is currently expected to

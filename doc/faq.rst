@@ -66,16 +66,14 @@ while it is not clear where to better put them).
 
 * **How is multicast supported?**
 
-  Support for multicast is currently limited.
-
   On the server side, things are mostly ready.
   Groups are joined :meth:`at server creation<aiocoap.protocol.Context.create_server_context>`.
 
-  On the client side, requests to multicast addresses can be sent,
-  and while they are treated adaequately on the protocol level (eg. will not send CON requests),
-  the :meth:`request interface<aiocoap.protocol.Context.request>` only exposes the first response.
-  Thus, it can be used in discovery situations as long as only one response is processed,
-  but not yet to its full power of obtaining data from multiple devices.
+  On the client side, multicast requests are sent using
+  :meth:`Context.multicast_request<aiocoap.protocol.Context.multicast_request>`,
+  which reports the responses of all responding devices during asynchronous iteration.
+  (When the regular :meth:`request interface<aiocoap.protocol.Context.request>` is used
+  with a multicast address, only the first response is exposed).
 
   Note that multicast requests often require specification of an interface,
   as otherwise the request is underspecified.

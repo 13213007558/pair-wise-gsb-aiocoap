@@ -2,6 +2,21 @@
   :copyright: SPDX-FileCopyrightText: Christian Amsüss
   :copyright: SPDX-License-Identifier: MIT
 
+Unreleased
+----------
+
+Enhancements
+~~~~~~~~~~~~
+
+* Client-side multicast requests are now supported through
+  ``Context.multicast_request``: A single multicast request (eg. for device
+  discovery) yields the responses of all responding devices during
+  asynchronous iteration, until the discovery window ends.
+
+  Responses are attributed to their sender, duplicate datagrams are
+  suppressed, blockwise (Block2) responses are assembled per responding
+  device, and a failing device does not affect the others.
+
 Version 0.4.17
 --------------
 
