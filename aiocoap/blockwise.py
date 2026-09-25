@@ -4,6 +4,7 @@
 
 """Helpers for the implementation of RFC7959 blockwise transfers"""
 
+import secrets
 from typing import Awaitable, Callable
 
 from . import numbers
@@ -15,21 +16,37 @@ from .optiontypes import BlockOption
 from .util.asyncio.timeoutdict import TimeoutDict
 
 
-def _extract_block_key(message):
+def new_request_tag():
+    """Generate an identifier for a blockwise request operation."""
+    return secrets.token_bytes(8)
+
+
+def _request_tag_set(message):
+    return frozenset(message.opt.request_tag)
+
+
+def extract_block_key(message, request_tag=None):
     """Extract a key that hashes equally for all blocks of a blockwise
     operation from a request message.
 
-    See discussion at <https://mailarchive.ietf.org/arch/msg/core/I-6LzAL6lIUVDA6_g9YM3Zjhg8E>.
+    Request-Tag is part of the operation identity. In particular, the token
+    identifies an individual message exchange and must not be used as the
+    identity of a whole request body.
     """
+
+    if request_tag is None:
+        request_tag = _request_tag_set(message)
 
     return (
         message.remote.blockwise_key,
         message.code,
+        request_tag,
         message.get_cache_key(
             [
                 OptionNumber.BLOCK1,
                 OptionNumber.BLOCK2,
                 OptionNumber.OBSERVE,
+                OptionNumber.REQUEST_TAG,
             ]
         ),
     )
@@ -72,7 +89,7 @@ class Block1Spool:
         if req.opt.block1 is None:
             return req
 
-        block_key = _extract_block_key(req)
+        block_key = extract_block_key(req)
 
         if req.opt.block1.block_number == 0:
             # silently discarding any old incomplete operation
@@ -117,7 +134,7 @@ class Block2Cache:
           * return the first chunk and store it for later use
 
         """
-        block_key = _extract_block_key(req)
+        block_key = extract_block_key(req)
 
         if req.opt.block2 is None or req.opt.block2.block_number == 0:
             assembled = await response_builder()

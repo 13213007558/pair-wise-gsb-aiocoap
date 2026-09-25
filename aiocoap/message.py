@@ -521,6 +521,7 @@ class Message:
             token=None,
             block2=blockopt,
             block1=None,
+            request_tag=self.opt.request_tag,
             observe=None,
         )
 

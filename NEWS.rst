@@ -13,6 +13,10 @@ Enhancements
   This allows use of unauthenticated servers
   (eg. in opportunistic encryption, or when only the client needs to be authenticated)
   when the server would only send a credential key ID by default.
+* Block1 requests use RFC 9175 Request-Tag values to identify an entire request body.
+
+  Concurrent blockwise uploads to the same URI are assembled independently,
+  and transparent proxies can add their own tag while preserving tags from the client.
 
 Compatibility
 ~~~~~~~~~~~~~

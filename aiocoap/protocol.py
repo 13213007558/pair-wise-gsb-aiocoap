@@ -57,6 +57,7 @@ from .messagemanager import MessageManager
 from .tokenmanager import TokenManager
 from .pipe import Pipe, run_driving_pipe, error_to_message
 from .util import DeprecationWarning
+from .blockwise import new_request_tag
 from . import interfaces
 from . import error
 from .numbers import INTERNAL_SERVER_ERROR, NOT_FOUND, CONTINUE, SHUTDOWN_TIMEOUT
@@ -899,6 +900,7 @@ class BlockwiseRequest(BaseUnicastRequest, interfaces.Request):
         # Offset in the message in blocks of size_exp. Whoever changes size_exp
         # is responsible for updating this number.
         block_cursor = 0
+        request_tag = tuple(app_request.opt.request_tag) or (new_request_tag(),)
 
         while True:
             # ... send a chunk
@@ -920,6 +922,9 @@ class BlockwiseRequest(BaseUnicastRequest, interfaces.Request):
                     current_block1.opt.size1 = len(app_request.payload)
             else:
                 current_block1 = app_request
+
+            if current_block1.opt.block1 is not None:
+                current_block1.opt.request_tag = request_tag
 
             blockrequest = protocol.request(current_block1, handle_blockwise=False)
             blockresponse = await blockrequest.response
@@ -955,14 +960,17 @@ class BlockwiseRequest(BaseUnicastRequest, interfaces.Request):
             if block1.block_number != current_block1.opt.block1.block_number:
                 raise error.UnexpectedBlock1Option("Block number mismatch")
 
-            if size_exp == 7:
+            if block1.size_exponent != size_exp:
+                if block1.block_number != 0:
+                    raise error.UnexpectedBlock1Option(
+                        "Block size negotiation after the first block is not supported"
+                    )
+                size_exp = block1.size_exponent
+                block_cursor = 0
+            elif size_exp == 7:
                 block_cursor += len(current_block1.payload) // 1024
             else:
                 block_cursor += 1
-
-            while block1.size_exponent < size_exp:
-                block_cursor *= 2
-                size_exp -= 1
 
             if not current_block1.opt.block1.more:
                 if block1.more or blockresponse.code == CONTINUE:

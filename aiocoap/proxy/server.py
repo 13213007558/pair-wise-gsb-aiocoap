@@ -14,8 +14,15 @@ import warnings
 
 from .. import numbers, interfaces, message, error, util, resource
 from ..numbers import codes
-from ..blockwise import Block1Spool, Block2Cache
+from ..blockwise import (
+    Block1Spool,
+    Block2Cache,
+    IncompleteException,
+    extract_block_key,
+    new_request_tag,
+)
 from ..pipe import Pipe
+from ..util.asyncio.timeoutdict import TimeoutDict
 from ..util import DeprecationWarning
 
 
@@ -93,6 +100,9 @@ class Proxy(interfaces.Resource):
         # render_to_pipe right on its own
         self._block1 = Block1Spool()
         self._block2 = Block2Cache()
+        self._block1_request_tags = TimeoutDict(
+            numbers.TransportTuning().MAX_TRANSMIT_WAIT
+        )
 
         self.outgoing_context = outgoing_context
         self.log = logger or logging.getLogger("proxy")
@@ -117,6 +127,8 @@ class Proxy(interfaces.Resource):
         # wants. everything the responder needs of the request should be
         # extracted beforehand.
         request = request.copy(mid=None, token=None)
+        if not self.interpret_block_options:
+            self._add_block1_request_tag(request)
 
         try:
             redirected = self.apply_redirection(request)
@@ -148,6 +160,27 @@ class Proxy(interfaces.Resource):
         response.token = None
 
         return response
+
+    def _add_block1_request_tag(self, request):
+        if request.opt.block1 is None:
+            return
+
+        block_key = extract_block_key(request)
+        request_tags = tuple(request.opt.request_tag)
+
+        if request.opt.block1.block_number == 0:
+            try:
+                proxy_tag = self._block1_request_tags[block_key]
+            except KeyError:
+                proxy_tag = new_request_tag()
+                self._block1_request_tags[block_key] = proxy_tag
+        else:
+            try:
+                proxy_tag = self._block1_request_tags[block_key]
+            except KeyError:
+                raise IncompleteException from None
+
+        request.opt.request_tag = request_tags + (proxy_tag,)
 
     # Not inheriting from them because we do *not* want the .render() in the
     # resolution tree (it can't deal with None requests, which are used among
