@@ -59,7 +59,13 @@ from .pipe import Pipe, run_driving_pipe, error_to_message
 from .util import DeprecationWarning
 from . import interfaces
 from . import error
-from .numbers import INTERNAL_SERVER_ERROR, NOT_FOUND, CONTINUE, SHUTDOWN_TIMEOUT
+from .numbers import (
+    INTERNAL_SERVER_ERROR,
+    NOT_FOUND,
+    CONTINUE,
+    SHUTDOWN_TIMEOUT,
+    UNAUTHORIZED,
+)
 from .config import TransportParameters
 
 import warnings
@@ -814,6 +820,13 @@ class Request(interfaces.Request, BaseUnicastRequest):
 
 
 class BlockwiseRequest(BaseUnicastRequest, interfaces.Request):
+    #: Maximum number of times a request is re-sent with an Echo option when
+    #: the server keeps answering with an RFC9175 Echo challenge (a 4.01
+    #: response carrying an Echo option). The bound ensures that a server
+    #: that never accepts any Echo value can not make the client resend its
+    #: request indefinitely.
+    max_echo_retries = 2
+
     def __init__(self, protocol, app_request):
         self.protocol = protocol
         self.log = self.protocol.log.getChild("blockwise-requester")
@@ -900,6 +913,9 @@ class BlockwiseRequest(BaseUnicastRequest, interfaces.Request):
         # is responsible for updating this number.
         block_cursor = 0
 
+        # Number of RFC9175 Echo challenges answered so far
+        echo_retries = 0
+
         while True:
             # ... send a chunk
 
@@ -935,6 +951,30 @@ class BlockwiseRequest(BaseUnicastRequest, interfaces.Request):
                     app_request.remote.maximum_block_size_exp
                 )
             app_request.remote = blockresponse.remote
+
+            if (
+                blockresponse.code == UNAUTHORIZED
+                and blockresponse.opt.echo is not None
+            ):
+                # RFC9175 Echo challenge: The server asks for proof of
+                # reachability before it processes the request. Repeat the
+                # request unchanged (method, payload and options), only
+                # adding the Echo option it provided -- but only a bounded
+                # number of times, so a server that keeps challenging can not
+                # keep this loop running forever.
+                if echo_retries < cls.max_echo_retries:
+                    echo_retries += 1
+                    log.debug(
+                        "Server sent an Echo challenge, resending the request with the Echo option."
+                    )
+                    app_request = app_request.copy()
+                    app_request.opt.echo = blockresponse.opt.echo
+                    block_cursor = 0
+                    continue
+                else:
+                    log.warning(
+                        "Server keeps sending Echo challenges, not retrying again."
+                    )
 
             if blockresponse.opt.block1 is None:
                 if blockresponse.code.is_successful() and current_block1.opt.block1:

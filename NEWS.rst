@@ -8,6 +8,12 @@ Version 0.4.17
 Enhancements
 ~~~~~~~~~~~~
 
+* RFC9175 Echo options are now supported:
+  Servers can wrap any resource in :class:`aiocoap.echo.EchoResourceWrapper`
+  with a policy (eg. the address-binding :class:`aiocoap.echo.AddressBoundEchoPolicy`)
+  to challenge requesters for proof of reachability before running handlers with side effects,
+  and managed client requests automatically answer a bounded number of such challenges.
+
 * EDHOC requests now send the CRED_BY_VALUE EAD item.
 
   This allows use of unauthenticated servers
