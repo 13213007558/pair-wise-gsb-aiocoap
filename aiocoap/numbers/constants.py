@@ -145,6 +145,18 @@ class TransportTuning:
     DEFAULT_LEISURE = 5
 
     @property
+    def MULTICAST_DISCOVERY_WINDOW(self):
+        """Time for which responses to a multicast request sent through
+        :meth:`aiocoap.Context.multicast_request` are collected before the
+        discovery window is closed.
+
+        Servers may delay their responses to multicast requests by up to
+        DEFAULT_LEISURE; responses that arrive later than that plus the time
+        a datagram may be under way are not delivered to the application any
+        more."""
+        return self.DEFAULT_LEISURE + self.MAX_LATENCY
+
+    @property
     def MULTICAST_REQUEST_TIMEOUT(self):
         warnings.warn(
             "parameter is unused; use asyncio mechanisms to time out requests",

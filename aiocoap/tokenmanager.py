@@ -21,6 +21,11 @@ class TokenManager(interfaces.RequestInterface, interfaces.TokenManager):
         self._token = random.randint(0, 65535)
         self.outgoing_requests = {}
         """Unfinished outgoing requests (identified by token and remote)"""
+        self.multicast_keys = set()
+        """Subset of the keys of outgoing_requests that belong to multicast
+        requests. Unlike unicast requests, these are not completed by a
+        response, but stay registered (and keep accepting responses from any
+        remote) until the requester ends its interest."""
         self.incoming_requests = {}
         """Unfinished incoming requests.
 
@@ -58,6 +63,7 @@ class TokenManager(interfaces.RequestInterface, interfaces.TokenManager):
             request = self.outgoing_requests.pop(key)
             request.add_exception(error.LibraryShutdown())
         self.outgoing_requests = None
+        self.multicast_keys = None
 
         await self.token_interface.shutdown()
 
@@ -188,6 +194,14 @@ class TokenManager(interfaces.RequestInterface, interfaces.TokenManager):
         else:
             self.log.debug("Response %r matched to request %r", response, request)
 
+        if key in self.multicast_keys:
+            # A multicast request collects responses from any remote until the
+            # requester ends its interest (typically when its discovery window
+            # expires); a single response neither completes the request nor
+            # deregisters its token.
+            request.add_response(response, is_last=False)
+            return True
+
         # FIXME: there's a multicast aspect to that as well
         #
         # Is it necessary to look into .opt.observe here, wouldn't that better
@@ -278,3 +292,67 @@ class TokenManager(interfaces.RequestInterface, interfaces.TokenManager):
             # keep an eye out for responses on that token and cancel
             # transmission accordingly.
             request.on_event(lambda ev: (send_canceller(), False)[1], is_interest=False)
+
+    def multicast_request(self, request):
+        """Like :meth:`request`, but for requests to a multicast remote.
+
+        The request stays registered after the first (and any further)
+        response, and responses from any remote are fed into the pipe (with
+        is_last=False) until the requester ends its interest, which
+        deregisters the token.
+        """
+        if self.outgoing_requests is None:
+            request.add_exception(error.LibraryShutdown())
+            return
+
+        msg = request.request
+
+        assert msg.code.is_request(), "Message code is not valid for request"
+
+        # This might easily change, but right now, relying on the Context to
+        # fill_remote early makes steps easier here.
+        assert msg.remote is not None, "Remote not pre-populated"
+
+        if not msg.remote.is_multicast:
+            request.add_exception(
+                ValueError("multicast_request can only be used with multicast remotes")
+            )
+            return
+
+        msg.token = self.next_token()
+
+        self.log.debug(
+            "Sending multicast request - Token: %s, Remote: %s",
+            msg.token.hex(),
+            msg.remote,
+        )
+
+        # Responses come in from any remote, so unlike unicast requests, this
+        # is not keyed by the remote.
+        key = (msg.token, None)
+
+        self.outgoing_requests[key] = request
+        self.multicast_keys.add(key)
+
+        # Capture the dicts now: they may be replaced with None at shutdown,
+        # and this callback may only run after that.
+        outgoing_requests = self.outgoing_requests
+        multicast_keys = self.multicast_keys
+
+        def interest_end():
+            outgoing_requests.pop(key, None)
+            multicast_keys.discard(key)
+
+        request.on_interest_end(interest_end)
+
+        try:
+            self.token_interface.send_message(
+                msg, lambda: request.add_exception(error.MessageError)
+            )
+        except Exception as e:
+            request.add_exception(e)
+            return
+
+        # No send_canceller is handled here (and none is expected): Multicast
+        # requests are always sent as NON, so there are no retransmissions to
+        # stop when a response comes in.

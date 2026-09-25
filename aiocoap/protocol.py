@@ -105,6 +105,7 @@ class Context(interfaces.RequestProvider):
     CoAP requests can be sent using the following functions:
 
     .. automethod:: request
+    .. automethod:: multicast_request
 
     If more control is needed, you can create a :class:`Request` yourself and
     pass the context to it.
@@ -575,6 +576,24 @@ class Context(interfaces.RequestProvider):
         )
         return result
 
+    def multicast_request(self, request_message):
+        """Send a request to a multicast address, and collect the responses
+        of the responding hosts for the duration of a discovery window.
+
+        The returned :class:`MulticastRequest` is asynchronously iterable;
+        iteration yields one response per responding remote (with any
+        blockwise transfer of that response completed individually per
+        remote), and ends when the discovery window (see
+        :attr:`aiocoap.numbers.constants.TransportTuning.MULTICAST_DISCOVERY_WINDOW`)
+        expires.
+
+        When iteration is ended prematurely, the discovery state (most
+        notably the request's token) is released; to ensure that this happens
+        deterministically, use ``contextlib.aclosing`` or explicitly aclose
+        the iterator when not draining it completely.
+        """
+        return MulticastRequest(self, request_message)
+
     # the following are under consideration for moving into Site or something
     # mixed into it
 
@@ -811,6 +830,182 @@ class Request(interfaces.Request, BaseUnicastRequest):
                 )
                 self._stop_interest()
                 return
+
+
+class MulticastRequest(BaseRequest):
+    """A request to a multicast remote whose responses are collected for
+    the duration of a discovery window.
+
+    This is created through Context.multicast_request, and not instantiated
+    directly.
+
+    The object is asynchronously iterable. Every item yielded is a response
+    from a distinct responding remote; if a response is transferred
+    blockwise, the remaining blocks are requested from that remote
+    individually, and the assembled response is yielded. Responses that
+    arrive after the discovery window has closed, as well as responses
+    duplicated on the way (eg. retransmissions), are not delivered; the
+    same applies to responses whose blockwise transfer has not completed
+    when the discovery window closes.
+
+    Errors of an individual remote (eg. a failing blockwise transfer) are
+    logged and cause that remote's response to be skipped; they do not
+    affect the responses of other remotes.
+    """
+
+    _END = object()
+    """Sentinel placed on _out when no more responses will be delivered."""
+
+    def __init__(self, protocol, app_request):
+        self.protocol = protocol
+        self.log = protocol.log.getChild("multicast-request")
+        self.app_request = app_request
+
+        self._pipe = Pipe(app_request, self.log)
+        self._stop_interest = self._pipe.on_event(self._process_event)
+
+        self._out = asyncio.Queue()
+        self._seen_remotes = set()
+        self._completion_tasks = set()
+        self._finished = False
+        self._drained = False
+        self._watchdog = None
+
+        async def send():
+            try:
+                request_interface = await protocol.find_remote_and_interface(
+                    app_request
+                )
+                request_interface.multicast_request(self._pipe)
+            except Exception as e:
+                self._pipe.add_exception(e)
+                return
+
+            window = app_request.transport_tuning.MULTICAST_DISCOVERY_WINDOW
+            self._watchdog = protocol.loop.call_later(window, self._finish)
+
+        self._send_task = protocol.loop.create_task(
+            send(),
+            name="Multicast request processing of %r" % app_request,
+        )
+
+    def _process_event(self, event):
+        if event.message is not None:
+            response = event.message
+
+            # Responses are distinguished by the endpoint they come from;
+            # anything further from the same endpoint is a duplicate
+            # datagram (eg. a retransmission or a packet duplicated by the
+            # network).
+            key = response.remote.blockwise_key
+            if key in self._seen_remotes:
+                self.log.debug(
+                    "Ignoring duplicate response from %s",
+                    response.remote,
+                )
+                return True
+            self._seen_remotes.add(key)
+
+            task = self.protocol.loop.create_task(
+                self._complete_response(response),
+                name="Blockwise completion of a response to %r" % self.app_request,
+            )
+            self._completion_tasks.add(task)
+            task.add_done_callback(self._completion_tasks.discard)
+            return True
+
+        if event.exception is None:
+            # Tombstone of the pipe; can only occur when interest has
+            # already ended, in which case _finish has run already.
+            return False
+
+        # An exception is terminal for the whole request (eg. a shutdown or
+        # the request not being sendable at all).
+        self._out.put_nowait(event.exception)
+        self._finish()
+        return False
+
+    async def _complete_response(self, response):
+        """Fetch any remaining blocks of a single remote's response and
+        deliver the assembled response.
+
+        Each remote's response is completed individually: The follow-up
+        blockwise requests go to that remote only, and blocks of different
+        remotes are never assembled together.
+        """
+        try:
+            completed = await BlockwiseRequest._complete_by_requesting_block2(
+                self.protocol, self.app_request, response, self.log
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.log.warning(
+                "Dropping response from %s: Completing it failed",
+                response.remote,
+                exc_info=True,
+            )
+            return
+
+        completed.request = self.app_request
+        self._out.put_nowait(completed)
+
+    def _finish(self):
+        """Close the discovery window: Deregister the request, and deliver
+        the end-of-iteration marker once any in-flight blockwise
+        completions are cleaned up."""
+        if self._finished:
+            return
+        self._finished = True
+
+        if self._watchdog is not None:
+            self._watchdog.cancel()
+
+        # This deregisters the token; responses that only arrive later are
+        # not matched to this request any more.
+        self._stop_interest()
+
+        # Responses whose blockwise transfer has not completed by now are
+        # not delivered; cancelling them also releases their follow-up
+        # requests. (Awaiting them instead could hold the discovery window
+        # open indefinitely when a device goes silent mid-transfer.)
+        for task in self._completion_tasks:
+            task.cancel()
+
+        async def drain():
+            if self._completion_tasks:
+                await asyncio.gather(*self._completion_tasks, return_exceptions=True)
+            self._out.put_nowait(self._END)
+
+        self.protocol.loop.create_task(
+            drain(),
+            name="Multicast request cleanup of %r" % self.app_request,
+        )
+
+    def cancel(self):
+        """Stop collecting responses and release all state of this
+        discovery.
+
+        This is called automatically when the async iteration ends (both
+        when the discovery window expires and when the iterator is closed
+        early), and thus rarely needs to be invoked explicitly.
+        """
+        self._finish()
+
+    async def __aiter__(self):
+        try:
+            while True:
+                if self._drained:
+                    return
+                item = await self._out.get()
+                if item is self._END:
+                    self._drained = True
+                    return
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            self.cancel()
 
 
 class BlockwiseRequest(BaseUnicastRequest, interfaces.Request):

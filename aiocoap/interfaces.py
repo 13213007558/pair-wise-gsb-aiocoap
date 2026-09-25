@@ -319,6 +319,18 @@ class RequestInterface(metaclass=abc.ABCMeta):
     def request(self, request: Pipe):
         pass
 
+    def multicast_request(self, request: Pipe):
+        """Send a multicast request, and feed all its responses into the pipe
+        until the requester ends its interest.
+
+        Unlike :meth:`request`, the request is not completed by a response;
+        responses from any remote are accepted until the requester ends its
+        interest in the pipe (which deregisters the request's token).
+        """
+        raise NotImplementedError(
+            "This request interface does not support multicast requests"
+        )
+
     @abc.abstractmethod
     async def recognize_remote(self, message):
         """Return True if the remote of this message is currently expected to

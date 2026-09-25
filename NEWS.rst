@@ -8,6 +8,11 @@ Version 0.4.17
 Enhancements
 ~~~~~~~~~~~~
 
+* Multicast requests can now be sent through ``Context.multicast_request``:
+  Its result is asynchronously iterable, and yields one response per
+  responding remote (completing blockwise transfers individually per
+  remote) until the discovery window closes.
+
 * EDHOC requests now send the CRED_BY_VALUE EAD item.
 
   This allows use of unauthenticated servers
