@@ -60,6 +60,7 @@ Modules with stable components
    module/aiocoap.numbers
    module/aiocoap.optiontypes
    module/aiocoap.resource
+   module/aiocoap.echo
    module/aiocoap.resourcedirectory.client.register
    module/aiocoap.util
    module/aiocoap.cli
