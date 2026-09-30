@@ -6,6 +6,7 @@ import copy
 
 import aiocoap
 import aiocoap.optiontypes
+from aiocoap.numbers.optionnumbers import OptionNumber
 
 import unittest
 
@@ -199,6 +200,259 @@ class TestReadExtendedFieldValue(unittest.TestCase):
                 + " , rawdata : "
                 + repr(argument[1]),
             )
+
+
+class TestExtendedToken(unittest.TestCase):
+    critical_lengths = (8, 13, 268, 269, 65804, 65805)
+
+    def test_udp_boundaries(self):
+        for length in self.critical_lengths:
+            with self.subTest(length=length):
+                token = bytes(range(256)) * (length // 256 + 1)
+                token = token[:length]
+                msg = aiocoap.Message(
+                    _mtype=aiocoap.CON,
+                    _mid=0x1234,
+                    code=aiocoap.GET,
+                    _token=token,
+                )
+                msg.opt.add_option(
+                    aiocoap.optiontypes.OpaqueOption(OptionNumber.ETAG, b"ab")
+                )
+                msg.payload = b"data"
+
+                encoded = msg.encode()
+                decoded = aiocoap.Message.decode(encoded, max_token_length=65805)
+
+                self.assertEqual(decoded.token, token)
+                self.assertEqual(decoded.opt.etag, b"ab")
+                self.assertEqual(decoded.payload, b"data")
+
+    def test_udp_truncated_and_limited(self):
+        token = b"t" * 13
+        encoded = aiocoap.Message(
+            _mtype=aiocoap.CON,
+            _mid=0,
+            code=aiocoap.GET,
+            _token=token,
+            payload=b"x",
+        ).encode()
+        truncated_token = encoded[:-3]
+
+        self.assertRaises(
+            aiocoap.error.UnparsableMessage,
+            aiocoap.Message.decode,
+            encoded[:4],
+        )
+        self.assertRaises(
+            aiocoap.error.UnparsableMessage,
+            aiocoap.Message.decode,
+            encoded[:5],
+        )
+        self.assertRaises(
+            aiocoap.error.UnparsableMessage,
+            aiocoap.Message.decode,
+            truncated_token,
+        )
+        self.assertRaises(
+            aiocoap.error.UnparsableMessage,
+            aiocoap.Message.decode,
+            encoded,
+            max_token_length=12,
+        )
+
+    def test_tcp_boundaries_and_incremental_decoding(self):
+        from aiocoap.transports import tcp
+
+        token_boundaries = (8, 13, 268, 269, 65804, 65805)
+        suffix_lengths = (12, 13, 269, 270, 65804, 65805)
+
+        for token_length in token_boundaries:
+            for suffix_length in suffix_lengths:
+                if token_length in (65804, 65805) and suffix_length > 13:
+                    continue
+                with self.subTest(
+                    token_length=token_length, suffix_length=suffix_length
+                ):
+                    msg = aiocoap.Message(
+                        code=aiocoap.GET,
+                        _token=b"t" * token_length,
+                    )
+                    msg.payload = b"p" * (suffix_length - 1)
+
+                    encoded = tcp._serialize(msg)
+                    token_offset, announced_token_length, announced_suffix = (
+                        tcp._extract_message_size(encoded, 65805)
+                    )
+                    self.assertEqual(announced_token_length, token_length)
+                    self.assertEqual(
+                        len(encoded),
+                        token_offset + token_length + announced_suffix,
+                    )
+                    self.assertEqual(announced_suffix, suffix_length)
+
+                    decoded = tcp._decode_message(encoded, 65805)
+                    self.assertEqual(decoded.token, b"t" * token_length)
+                    self.assertEqual(decoded.payload, b"p" * (suffix_length - 1))
+
+                    length_extended = {
+                        13: 1,
+                        14: 2,
+                        15: 4,
+                    }.get(encoded[0] >> 4, 0)
+                    tkl_extended = {
+                        13: 1,
+                        14: 2,
+                        15: 4,
+                    }.get(encoded[0] & 0x0F, 0)
+                    self.assertIsNone(tcp._extract_message_size(encoded[:0]))
+                    if length_extended:
+                        self.assertIsNone(
+                            tcp._extract_message_size(encoded[:length_extended])
+                        )
+                    header = tcp._extract_message_size(
+                        encoded[: length_extended + 2 + tkl_extended], 65805
+                    )
+                    self.assertEqual(sum(header), len(encoded))
+                    accumulated = b""
+                    for byte in encoded:
+                        accumulated += bytes((byte,))
+                        incremental_header = tcp._extract_message_size(
+                            accumulated, 65805
+                        )
+                        if incremental_header is not None:
+                            self.assertIsNotNone(incremental_header)
+                            self.assertEqual(sum(incremental_header), len(encoded))
+                    received = encoded
+                    incremental = tcp._decode_message(received, 65805)
+                    self.assertEqual(incremental.token, decoded.token)
+                    self.assertEqual(incremental.payload, decoded.payload)
+
+    def test_tcp_truncated_and_limited(self):
+        from aiocoap.transports import tcp
+
+        self.assertIsNone(tcp._extract_message_size(b"\x0d"))
+        self.assertEqual(tcp._extract_message_size(bytes((13, 0, 0))), (3, 13, 0))
+        self.assertRaises(
+            aiocoap.error.UnparsableMessage,
+            tcp._extract_message_size,
+            bytes((11, 0)),
+        )
+        self.assertRaises(
+            aiocoap.error.UnparsableMessage,
+            tcp._extract_message_size,
+            b"\x09",
+        )
+        self.assertEqual(tcp._extract_message_size(bytes((13, 0, 13))), (3, 26, 0))
+        self.assertRaises(
+            aiocoap.error.UnparsableMessage,
+            tcp._decode_message,
+            bytes((13, 0, 13)),
+        )
+        oversized = b"\x0d\x00\x0d\x0d" + b"t" * 13
+        self.assertRaises(
+            aiocoap.error.UnparsableMessage,
+            tcp._extract_message_size,
+            oversized,
+            12,
+        )
+        self.assertRaises(
+            aiocoap.error.UnparsableMessage,
+            tcp._extract_message_size,
+            bytes((0x0F, 0, 0xFF, 0xFF, 0xFF, 0xFF)),
+        )
+
+    def test_tcp_options_and_ws_boundaries(self):
+        from aiocoap.transports import ws
+
+        for token_length in (8, 13):
+            from aiocoap.transports import tcp
+
+            with self.subTest(token_length=token_length):
+                msg = aiocoap.Message(
+                    code=aiocoap.GET,
+                    _token=b"t" * token_length,
+                )
+                msg.opt.add_option(
+                    aiocoap.optiontypes.OpaqueOption(OptionNumber.ETAG, b"ab")
+                )
+                msg.payload = b"payload"
+                encoded = tcp._serialize(msg)
+                suffix = msg.opt.encode() + bytes((0xFF,)) + msg.payload
+                token_offset, decoded_token_length, announced_suffix = (
+                    tcp._extract_message_size(encoded, 65805)
+                )
+                self.assertEqual(decoded_token_length, token_length)
+                self.assertEqual(announced_suffix, len(suffix))
+                self.assertEqual(encoded[token_offset + token_length :], suffix)
+
+        for length in self.critical_lengths:
+            with self.subTest(length=length):
+                msg = aiocoap.Message(
+                    code=aiocoap.GET,
+                    _token=b"t" * length,
+                    payload=b"x",
+                )
+                encoded = ws._serialize(msg)
+                decoded = ws._decode_message(encoded, max_token_length=65805)
+                self.assertEqual(decoded.token, msg.token)
+                self.assertEqual(decoded.payload, b"x")
+
+    def test_reliable_capability(self):
+        from aiocoap.transports.rfc8323common import RFC8323Remote
+
+        class DummyReliableRemote(RFC8323Remote):
+            hostinfo = "example"
+            hostinfo_local = "local"
+            uri_base = "coap+tcp://example"
+            uri_base_local = "coap+tcp://local"
+            is_multicast = False
+            is_multicast_locally = False
+            scheme = "coap+tcp"
+
+            def _send_message(self, msg):
+                pass
+
+        remote = DummyReliableRemote()
+        request = aiocoap.Message(code=aiocoap.GET, _token=b"t" * 13)
+
+        self.assertRaises(ValueError, remote._check_outgoing_token, request)
+        csm = aiocoap.Message(code=aiocoap.CSM)
+        csm.opt.add_option(aiocoap.optiontypes.OpaqueOption(6, bytes((12,))))
+        remote._process_signaling(csm)
+
+        self.assertEqual(remote.max_supported_token_length, 12)
+        remote._check_outgoing_token(
+            aiocoap.Message(code=aiocoap.GET, _token=b"t" * 12)
+        )
+        self.assertRaises(ValueError, remote._check_outgoing_token, request)
+
+    def test_udp_capability(self):
+        from aiocoap.transports.udp6 import UDP6EndpointAddress
+
+        sockaddr = ("::1", 1234, 0, 0)
+
+        class DummyInterface:
+            pass
+
+        interface = DummyInterface()
+        request = aiocoap.Message(code=aiocoap.GET, _token=b"t" * 13)
+
+        default_remote = UDP6EndpointAddress(sockaddr, interface)
+        self.assertEqual(default_remote.max_supported_token_length, 8)
+        self.assertRaises(ValueError, default_remote.check_outgoing_token, request)
+
+        allowed_remote = UDP6EndpointAddress(
+            sockaddr,
+            interface,
+            allow_extended_tokens=True,
+            max_token_length=13,
+        )
+        allowed_remote.check_outgoing_token(request)
+
+        learned_remote = UDP6EndpointAddress(sockaddr, interface)
+        learned_remote.set_extended_token_supported(True, max_token_length=13)
+        learned_remote.check_outgoing_token(request)
 
 
 class TestUintOption(unittest.TestCase):

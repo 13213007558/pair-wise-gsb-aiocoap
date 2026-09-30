@@ -16,7 +16,13 @@ from warnings import warn
 from . import error, optiontypes
 from .numbers.codes import Code, CHANGED
 from .numbers.types import Type
-from .numbers.constants import TransportTuning, MAX_REGULAR_BLOCK_SIZE_EXP
+from .numbers.constants import (
+    TransportTuning,
+    MAX_REGULAR_BLOCK_SIZE_EXP,
+    DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH,
+    MAX_EXTENDED_TOKEN_LENGTH,
+    MAX_TOKEN_LENGTH,
+)
 from .numbers import uri_path_abbrev
 from .options import Options
 from .util import (
@@ -35,6 +41,56 @@ __all__ = ["Message", "NoResponse"]
 # patching possibly required and works with pluggable transports. urls qualify
 # if they can be parsed into the Proxy-Scheme / Uri-* structure.
 coap_schemes = ["coap", "coaps", "coap+tcp", "coaps+tcp", "coap+ws", "coaps+ws"]
+
+
+def encode_token_length(token_length):
+    if 0 <= token_length <= MAX_TOKEN_LENGTH:
+        return token_length, b""
+    if 13 <= token_length <= 268:
+        return 13, (token_length - 13).to_bytes(1, "big")
+    if 269 <= token_length <= 65804:
+        return 14, (token_length - 269).to_bytes(2, "big")
+    if 65805 <= token_length <= MAX_EXTENDED_TOKEN_LENGTH:
+        return 15, (token_length - 65805).to_bytes(4, "big")
+    raise ValueError("Token length out of range")
+
+
+def read_token_length(
+    short_length,
+    data,
+    offset=0,
+    max_token_length=MAX_TOKEN_LENGTH,
+):
+    """Read an RFC 8974 token length without retaining the announced bytes."""
+    extended_value = 0
+    if short_length <= 8:
+        token_length = short_length
+        extended_length = b""
+    elif short_length == 13:
+        if len(data) < offset + 1:
+            raise error.UnparsableMessage("Extended token length ended prematurely")
+        extended_length = data[offset : offset + 1]
+        extended_value = extended_length[0]
+        token_length = extended_value + 13
+    elif short_length == 14:
+        if len(data) < offset + 2:
+            raise error.UnparsableMessage("Extended token length ended prematurely")
+        extended_length = data[offset : offset + 2]
+        extended_value = int.from_bytes(extended_length, "big")
+        token_length = extended_value + 269
+    elif short_length == 15:
+        if len(data) < offset + 4:
+            raise error.UnparsableMessage("Extended token length ended prematurely")
+        extended_length = data[offset : offset + 4]
+        extended_value = int.from_bytes(extended_length, "big")
+        token_length = extended_value + 65805
+    else:
+        raise error.UnparsableMessage("Reserved token length")
+
+    if token_length > max_token_length:
+        raise error.UnparsableMessage("Token longer than accepted by this endpoint")
+    return token_length, extended_length
+
 
 # Monkey patch urllib to make URL joining available in CoAP
 # This is a workaround for <http://bugs.python.org/issue23759>.
@@ -287,7 +343,7 @@ class Message:
             else:
                 from .util.prettyprint import pretty_print, lexer_for_mime
 
-                (notes, mediatype, text) = pretty_print(self)
+                notes, mediatype, text = pretty_print(self)
                 import pygments
                 from pygments.formatters import HtmlFormatter
 
@@ -335,22 +391,34 @@ class Message:
         return new
 
     @classmethod
-    def decode(cls, rawdata, remote=None):
+    def decode(
+        cls,
+        rawdata,
+        remote=None,
+        *,
+        max_token_length=DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH,
+    ):
         """Create Message object from binary representation of message."""
         try:
-            (vttkl, code, mid) = struct.unpack("!BBH", rawdata[:4])
+            vttkl, code, mid = struct.unpack("!BBH", rawdata[:4])
         except struct.error:
             raise error.UnparsableMessage("Incoming message too short for CoAP")
         version = (vttkl & 0xC0) >> 6
         if version != 1:
             raise error.UnparsableMessage("Fatal Error: Protocol Version must be 1")
         mtype = (vttkl & 0x30) >> 4
-        token_length = vttkl & 0x0F
+        short_token_length = vttkl & 0x0F
         msg = Message(code=code)
         msg.mid = mid
         msg.mtype = Type(mtype)
-        msg.token = rawdata[4 : 4 + token_length]
-        msg.payload = msg.opt.decode(rawdata[4 + token_length :])
+        token_length, extended_token_length = read_token_length(
+            short_token_length, rawdata, 4, max_token_length
+        )
+        token_offset = 4 + len(extended_token_length)
+        if len(rawdata) < token_offset + token_length:
+            raise error.UnparsableMessage("Token ended prematurely")
+        msg.token = rawdata[token_offset : token_offset + token_length]
+        msg.payload = msg.opt.decode(rawdata[token_offset + token_length :])
         msg.remote = remote
         msg.direction = Direction.INCOMING
         return msg
@@ -364,14 +432,12 @@ class Message:
             raise TypeError(
                 "Fatal Error: Code, Message Type and Message ID must not be None."
             )
+        short_token_length, extended_token_length = encode_token_length(len(self.token))
         rawdata = bytes(
-            [
-                (self.version << 6)
-                + ((self.mtype & 0x03) << 4)
-                + (len(self.token) & 0x0F)
-            ]
+            [(self.version << 6) + ((self.mtype & 0x03) << 4) + short_token_length]
         )
         rawdata += struct.pack("!BH", self.code, self.mid)
+        rawdata += extended_token_length
         rawdata += self.token
         rawdata += self.opt.encode()
         if len(self.payload) > 0:
@@ -509,9 +575,9 @@ class Message:
         )
 
         # has been checked in assembly, just making sure
-        assert blockopt.start == len(response.payload), (
-            "Unexpected state of preassembled message"
-        )
+        assert blockopt.start == len(
+            response.payload
+        ), "Unexpected state of preassembled message"
 
         blockopt = blockopt.reduced_to(response.remote.maximum_block_size_exp)
 
@@ -587,9 +653,9 @@ class Message:
                 PendingDeprecationWarning,
                 stacklevel=2,
             )
-            assert local_is_server == inferred_local_is_server, (
-                "local_is_server value mismatches message direction"
-            )
+            assert (
+                local_is_server == inferred_local_is_server
+            ), "local_is_server value mismatches message direction"
         else:
             local_is_server = inferred_local_is_server
 
@@ -835,7 +901,7 @@ class UndecidedRemote(
         if hostinfo is None:
             return cls.from_pathless_uri(scheme)
         if "[" in hostinfo:
-            (host, port) = hostportsplit(hostinfo)
+            host, port = hostportsplit(hostinfo)
             ip = ipaddress.ip_address(host)
             host = str(ip)
             hostinfo = hostportjoin(host, port)

@@ -27,9 +27,16 @@ class _TLSMixIn:
 
 class TLSServer(_TLSMixIn, TCPServer):
     @classmethod
-    async def create_server(cls, bind, tman, log, loop, server_context):
+    async def create_server(
+        cls, bind, tman, log, loop, server_context, *, max_token_length=None
+    ):
         return await super().create_server(
-            bind, tman, log, loop, _server_context=server_context
+            bind,
+            tman,
+            log,
+            loop,
+            _server_context=server_context,
+            max_token_length=max_token_length,
         )
 
 

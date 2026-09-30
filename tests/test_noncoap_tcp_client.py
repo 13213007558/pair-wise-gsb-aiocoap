@@ -104,7 +104,7 @@ class TestNoncoapTCPClient(WithTestServer):
         # it's not a per-spec wrong thing to do, but highly unusual
         self.assertEqual(messages, [], "Server sent messages on its own")
 
-    @precise_warnings(["Aborting connection: Failed to parse message"])
+    @precise_warnings(["Aborting connection: Overly long token"])
     async def test_http_get(self):
         await self.should_abort_early(b"GET /.well-known/core HTTP/1.0")
 
@@ -143,10 +143,7 @@ class TestNoncoapTCPClient(WithTestServer):
 
     @precise_warnings(["Aborting connection: Failed to parse message"])
     async def test_wrong_tkl(self):
-        # send an unspecified token length of 15.
-        # the rest of the message is an empty CSM, so if the server were to
-        # extrapolate from the meaning of tkl 0..8, it'd read it as OK.
-        await self.should_abort_early(b"\x0fxxxxxxxxxxxxxxx\xe1")
+        await self.should_abort_early(bytes((0x09, 0xE1)))
 
     # Fun inside the CSM
 

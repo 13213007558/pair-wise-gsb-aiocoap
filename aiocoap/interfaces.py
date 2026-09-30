@@ -17,7 +17,11 @@ import asyncio
 import warnings
 
 from aiocoap.pipe import Pipe
-from aiocoap.numbers.constants import MAX_REGULAR_BLOCK_SIZE_EXP
+from aiocoap.numbers.constants import (
+    DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH,
+    MAX_REGULAR_BLOCK_SIZE_EXP,
+    MAX_TOKEN_LENGTH,
+)
 from .util import DeprecationWarning
 
 from typing import Optional, Callable
@@ -166,6 +170,30 @@ class EndpointAddress(metaclass=abc.ABCMeta):
         message size when the block handlers can get serialization length
         predictions from the remote."""
         return 1124
+
+    @property
+    def max_supported_token_length(self) -> int:
+        return self._max_supported_token_length
+
+    _max_supported_token_length = MAX_TOKEN_LENGTH
+
+    _extended_token_supported = False
+
+    def set_extended_token_supported(self, supported, max_token_length=None):
+        """Record that a peer used an extended token and can therefore echo one."""
+        self._extended_token_supported = bool(supported)
+        if supported and max_token_length is not None:
+            self._max_supported_token_length = max_token_length
+        elif supported:
+            self._max_supported_token_length = (
+                DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH
+            )
+
+    def check_outgoing_token(self, message):
+        if message.code.is_request() and (
+            len(message.token) > self.max_supported_token_length
+        ):
+            raise ValueError("Peer did not permit a token of the given length")
 
     def as_response_address(self):
         """Address to be assigned to a response to messages that arrived with

@@ -32,6 +32,15 @@ MCAST_ALL = (
 
 MAX_REGULAR_BLOCK_SIZE_EXP = 6
 
+MAX_TOKEN_LENGTH = 8
+"""Maximum token length that is always understood by CoAP endpoints."""
+
+MAX_EXTENDED_TOKEN_LENGTH = 2**32 - 1
+"""Maximum token length expressible with an RFC 8974 extended length."""
+
+DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH = 65804
+"""Practical default limit for accepted extended tokens."""
+
 
 class TransportTuning:
     """Base parameters that guide CoAP transport behaviors
@@ -167,6 +176,9 @@ class TransportTuning:
     False) transmission if the protocol allows it for that request. (For
     example, it is ignored on multicast requests which can only be NON, and
     in an observation, a CON needs to be sent at least once a day)."""
+
+    token_length = MAX_TOKEN_LENGTH
+    """Preferred token length for initiated requests, limited by peer support."""
 
 
 _default_transport_tuning = TransportTuning()

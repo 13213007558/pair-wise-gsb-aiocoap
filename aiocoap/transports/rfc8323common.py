@@ -12,6 +12,10 @@ from typing import Optional
 from aiocoap import Message
 from aiocoap import optiontypes, util
 from aiocoap.numbers.codes import CSM, PING, PONG, RELEASE, ABORT
+from aiocoap.numbers.constants import (
+    DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH,
+    MAX_TOKEN_LENGTH,
+)
 from aiocoap import error
 
 
@@ -37,9 +41,11 @@ class RFC8323Remote:
 
     # Parameter usually set statically per implementation
     _my_max_message_size = 1024 * 1024
+    _my_max_token_length = DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH
 
     def __init__(self):
         self._remote_settings = None
+        self._remote_settings_event = asyncio.Event()
 
     is_multicast = False
     is_multicast_locally = False
@@ -117,6 +123,13 @@ class RFC8323Remote:
     def blockwise_key(self):
         return (self._remote_hostinfo, self._local_hostinfo)
 
+    @property
+    def max_supported_token_length(self) -> int:
+        remote_max = MAX_TOKEN_LENGTH
+        if self._remote_settings is not None:
+            remote_max = self._remote_settings.get("max-token-length", MAX_TOKEN_LENGTH)
+        return min(remote_max, self._my_max_token_length)
+
     # Utility methods for implementing an RFC8323 transport
 
     def _send_initial_csm(self):
@@ -128,12 +141,34 @@ class RFC8323Remote:
         my_csm.opt.add_option(block_length)
         supports_block = optiontypes.UintOption(4, 0)
         my_csm.opt.add_option(supports_block)
+        max_token = optiontypes.UintOption(6, self._my_max_token_length)
+        my_csm.opt.add_option(max_token)
         self._send_message(my_csm)
+
+    def _check_outgoing_token(self, msg):
+        if msg.code.is_request():
+            allowed = self._remote_settings is not None and (
+                "max-token-length" in self._remote_settings
+            )
+            if not allowed and len(msg.token) > MAX_TOKEN_LENGTH:
+                raise ValueError("Peer did not advertise support for extended tokens")
+        if len(msg.token) > self.max_supported_token_length:
+            raise ValueError("Peer did not permit a token of the given length")
+
+    async def wait_for_remote_settings(self):
+        while self._remote_settings is None:
+            await self._remote_settings_event.wait()
 
     def _process_signaling(self, msg):
         if msg.code == CSM:
+            duplicate_csm = self._remote_settings is not None
+            if duplicate_csm:
+                self.abort("Duplicate CSM")
+                return
             if self._remote_settings is None:
                 self._remote_settings = {}
+                self._remote_settings_event.set()
+            seen_max_token_length = False
             for opt in msg.opt.option_list():
                 # FIXME: this relies on the relevant option numbers to be
                 # opaque; message parsing should already use the appropriate
@@ -144,6 +179,17 @@ class RFC8323Remote:
                     )
                 elif opt.number == 4:
                     self._remote_settings["block-wise-transfer"] = True
+                elif opt.number == 6:
+                    raw_value = opt.value if isinstance(opt.value, bytes) else None
+                    if seen_max_token_length or raw_value is None or len(raw_value) > 4:
+                        self.abort("Invalid Max-Token-Length")
+                        return
+                    max_token_length = int.from_bytes(raw_value, "big")
+                    if max_token_length < MAX_TOKEN_LENGTH:
+                        self.abort("Invalid Max-Token-Length")
+                        return
+                    self._remote_settings["max-token-length"] = max_token_length
+                    seen_max_token_length = True
                 elif opt.number.is_critical():
                     self.abort("Option not supported", bad_csm_option=opt.number)
                 else:

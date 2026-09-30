@@ -48,6 +48,7 @@ class GenericMessageInterface(interfaces.MessageInterface):
                 "Not sending message %r: transport is already shutting down.", message
             )
         else:
+            message.remote.check_outgoing_token(message)
             message.remote.send(message.encode())
 
     async def shutdown(self):

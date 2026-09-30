@@ -75,6 +75,8 @@ from aiocoap.transports import rfc8323common
 from ..credentials import CredentialsMap
 from .. import defaults
 from ..message import Direction
+from ..message import encode_token_length, read_token_length
+from ..numbers import constants
 
 if not defaults.is_pyodide:
     import websockets.asyncio.connection
@@ -83,28 +85,32 @@ else:
     import aiocoap.util.pyodide_websockets as websockets  # type: ignore[no-redef]
 
 
-def _decode_message(data: bytes) -> Message:
+def _decode_message(
+    data: bytes,
+    max_token_length=constants.DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH,
+) -> Message:
     codeoffset = 1
-    tokenoffset = 2
 
-    tkl = data[0]
-    if tkl > 8:
-        raise error.UnparsableMessage("Overly long token")
+    short_tkl = data[0]
     code = data[codeoffset]
-    token = data[tokenoffset : tokenoffset + tkl]
+    token_length, extended_token_length = read_token_length(
+        short_tkl, data, 2, max_token_length
+    )
+    tokenoffset = 2 + len(extended_token_length)
+    if len(data) < tokenoffset + token_length:
+        raise error.UnparsableMessage("Token ended prematurely")
+    token = data[tokenoffset : tokenoffset + token_length]
 
     msg = Message(code=code, _token=token)
 
-    msg.payload = msg.opt.decode(data[tokenoffset + tkl :])
+    msg.payload = msg.opt.decode(data[tokenoffset + token_length :])
     msg.direction = Direction.INCOMING
 
     return msg
 
 
 def _serialize(msg: Message) -> bytes:
-    tkl = len(msg.token)
-    if tkl > 8:
-        raise ValueError("Overly long token")
+    tkl, extended_token_length = encode_token_length(len(msg.token))
 
     data = [
         bytes(
@@ -113,6 +119,7 @@ def _serialize(msg: Message) -> bytes:
                 msg.code,
             )
         ),
+        extended_token_length,
         msg.token,
         msg.opt.encode(),
     ]
@@ -156,6 +163,7 @@ class WSRemote(rfc8323common.RFC8323Remote, interfaces.EndpointAddress):
         scheme,
         local_hostinfo=None,
         remote_hostinfo=None,
+        max_token_length=None,
     ):
         super().__init__()
         self._pool = weakref.ref(pool)
@@ -177,6 +185,8 @@ class WSRemote(rfc8323common.RFC8323Remote, interfaces.EndpointAddress):
             self._remote_hostinfo = remote_hostinfo
 
         self.scheme = scheme
+        if max_token_length is not None:
+            self._my_max_token_length = max_token_length
 
         # Goes both for client and for server ends; on the server end, it
         # ensures that role reversal URIs can be used even when passed as URIs
@@ -204,6 +214,8 @@ class WSRemote(rfc8323common.RFC8323Remote, interfaces.EndpointAddress):
         await self._connection.close(code=close_code)
 
     def _send_message(self, msg):
+        self._check_outgoing_token(msg)
+
         # FIXME overhaul back-pressure model
         async def send():
             self.log.debug("Sending message: %r", msg)
@@ -250,6 +262,7 @@ class WSPool(interfaces.TokenInterface):
         self.log = log
 
         self._client_credentials: CredentialsMap
+        self._max_token_length = constants.DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH
 
     @classmethod
     async def create_transport(
@@ -261,10 +274,12 @@ class WSPool(interfaces.TokenInterface):
         client_credentials,
         server_bind=None,
         server_context=None,
+        max_token_length=constants.DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH,
     ):
         self = cls(tman, log, loop)
 
         self._client_credentials = client_credentials
+        self._max_token_length = max_token_length
 
         if server_bind:
             host, port = server_bind
@@ -319,6 +334,7 @@ class WSPool(interfaces.TokenInterface):
             self.log,
             scheme=scheme,
             local_hostinfo=local_hostinfo,
+            max_token_length=self._max_token_length,
         )
         self._pool[remote._poolkey] = remote
 
@@ -387,9 +403,10 @@ class WSPool(interfaces.TokenInterface):
                 self.log,
                 scheme=key.scheme,
                 remote_hostinfo=hostinfo_split,
+                max_token_length=self._max_token_length,
             )
-            assert remote._poolkey == key, "Pool key construction is inconsistent"
             self._pool[key] = remote
+            await remote.wait_for_remote_settings()
 
             self.loop.create_task(
                 self._run_recv_loop(remote),
@@ -505,7 +522,7 @@ class WSPool(interfaces.TokenInterface):
                 return
 
             try:
-                msg = _decode_message(received)
+                msg = _decode_message(received, remote._my_max_token_length)
             except error.UnparsableMessage:
                 await remote._abort_with_waiting(
                     Message(code=ABORT, payload=b"Message parsing error"),

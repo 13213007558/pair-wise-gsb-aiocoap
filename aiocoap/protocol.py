@@ -259,14 +259,23 @@ class Context(interfaces.RequestProvider):
             from .transports.tcp import TCPClient
 
             await self._append_tokenmanaged_transport(
-                lambda tman: TCPClient.create_client_transport(tman, self.log, loop)
+                lambda tman: TCPClient.create_client_transport(
+                    tman,
+                    self.log,
+                    loop,
+                    max_token_length=selected_transports.tcpclient.max_token_length,
+                )
             )
         if selected_transports.tlsclient:
             from .transports.tls import TLSClient
 
             await self._append_tokenmanaged_transport(
                 lambda tman: TLSClient.create_client_transport(
-                    tman, self.log, loop, self.client_credentials
+                    tman,
+                    self.log,
+                    loop,
+                    self.client_credentials,
+                    max_token_length=selected_transports.tlsclient.max_token_length,
                 )
             )
         if selected_transports.ws:
@@ -274,7 +283,11 @@ class Context(interfaces.RequestProvider):
 
             await self._append_tokenmanaged_transport(
                 lambda tman: WSPool.create_transport(
-                    tman, self.log, loop, client_credentials=self.client_credentials
+                    tman,
+                    self.log,
+                    loop,
+                    client_credentials=self.client_credentials,
+                    max_token_length=selected_transports.ws.max_token_length,
                 )
             )
 
@@ -437,13 +450,24 @@ class Context(interfaces.RequestProvider):
             from .transports.tcp import TCPServer
 
             await self._append_tokenmanaged_transport(
-                lambda tman: TCPServer.create_server(bind, tman, self.log, loop)
+                lambda tman: TCPServer.create_server(
+                    bind,
+                    tman,
+                    self.log,
+                    loop,
+                    max_token_length=selected_transports.tcpserver.max_token_length,
+                )
             )
         if selected_transports.tcpclient:
             from .transports.tcp import TCPClient
 
             await self._append_tokenmanaged_transport(
-                lambda tman: TCPClient.create_client_transport(tman, self.log, loop)
+                lambda tman: TCPClient.create_client_transport(
+                    tman,
+                    self.log,
+                    loop,
+                    max_token_length=selected_transports.tcpclient.max_token_length,
+                )
             )
         if selected_transports.tlsserver:
             if _ssl_context is not None:
@@ -451,7 +475,12 @@ class Context(interfaces.RequestProvider):
 
                 await self._append_tokenmanaged_transport(
                     lambda tman: TLSServer.create_server(
-                        bind, tman, self.log, loop, _ssl_context
+                        bind,
+                        tman,
+                        self.log,
+                        loop,
+                        _ssl_context,
+                        max_token_length=selected_transports.tlsserver.max_token_length,
                     )
                 )
             else:
@@ -465,7 +494,11 @@ class Context(interfaces.RequestProvider):
 
             await self._append_tokenmanaged_transport(
                 lambda tman: TLSClient.create_client_transport(
-                    tman, self.log, loop, self.client_credentials
+                    tman,
+                    self.log,
+                    loop,
+                    self.client_credentials,
+                    max_token_length=selected_transports.tlsclient.max_token_length,
                 )
             )
         if selected_transports.ws:
@@ -480,6 +513,7 @@ class Context(interfaces.RequestProvider):
                     client_credentials=self.client_credentials,
                     server_bind=bind or (None, None),
                     server_context=_ssl_context,
+                    max_token_length=selected_transports.ws.max_token_length,
                 )
             )
 
@@ -829,9 +863,11 @@ class BlockwiseRequest(BaseUnicastRequest, interfaces.Request):
             self._run_outer(
                 app_request,
                 self.response,
-                weakref.ref(self.observation)
-                if self.observation is not None
-                else lambda: None,
+                (
+                    weakref.ref(self.observation)
+                    if self.observation is not None
+                    else lambda: None
+                ),
                 self.protocol,
                 self.log,
             ),
@@ -886,12 +922,12 @@ class BlockwiseRequest(BaseUnicastRequest, interfaces.Request):
                 DeprecationWarning,
                 stacklevel=2,
             )
-            assert app_request.opt.block1.block_number == 0, (
-                "Unexpected block number in app_request"
-            )
-            assert not app_request.opt.block1.more, (
-                "Unexpected more-flag in app_request"
-            )
+            assert (
+                app_request.opt.block1.block_number == 0
+            ), "Unexpected block number in app_request"
+            assert (
+                not app_request.opt.block1.more
+            ), "Unexpected more-flag in app_request"
             # this is where the library user can traditionally pass in size
             # exponent hints into the library.
             size_exp = app_request.opt.block1.size_exponent
@@ -1030,7 +1066,9 @@ class BlockwiseRequest(BaseUnicastRequest, interfaces.Request):
             if obs is None:
                 lower_observation.cancel()
                 return
-            future_weak_observation = protocol.loop.create_future()  # packing this up because its destroy callback needs to reference the subtask
+            future_weak_observation = (
+                protocol.loop.create_future()
+            )  # packing this up because its destroy callback needs to reference the subtask
             subtask = asyncio.create_task(
                 cls._run_observation(
                     app_request,
@@ -1306,10 +1344,12 @@ class ClientObservation:
     def __repr__(self):
         return "<%s %s at %#x>" % (
             type(self).__name__,
-            "(cancelled)"
-            if self.cancelled
-            else "(%s call-, %s errback(s))"
-            % (len(self.callbacks), len(self.errbacks)),
+            (
+                "(cancelled)"
+                if self.cancelled
+                else "(%s call-, %s errback(s))"
+                % (len(self.callbacks), len(self.errbacks))
+            ),
             id(self),
         )
 

@@ -76,6 +76,14 @@ Transport specifics
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from aiocoap.numbers.constants import MAX_EXTENDED_TOKEN_LENGTH, MAX_TOKEN_LENGTH
+
+
+def _validate_max_token_length(max_token_length):
+    if not MAX_TOKEN_LENGTH <= max_token_length <= MAX_EXTENDED_TOKEN_LENGTH:
+        raise ValueError("max_token_length is outside the RFC 8974 range")
+
+
 from typing import Optional, Self
 
 from .util.dataclass_data import LoadStoreClass
@@ -136,6 +144,15 @@ class Udp6Parameters(LoadStoreClass):
     # FIXME: Check if bind-after-shutdown is still an issue; if so, document
     # why this is useful.
 
+    max_token_length: int = 65804
+    """Maximum token length accepted in incoming UDP datagrams."""
+
+    allow_extended_tokens: bool = False
+    """Allow initiating UDP exchanges with tokens longer than eight bytes."""
+
+    def __post_init__(self):
+        _validate_max_token_length(self.max_token_length)
+
 
 @dataclass
 class Simple6Parameters(LoadStoreClass):
@@ -161,25 +178,50 @@ class TinyDTLSServerParameters(LoadStoreClass):
 class TcpClientParameters(LoadStoreClass):
     """Parameters for setting up a :mod:`tcpclient <aiocoap.transports.tcpclient>` transport."""
 
+    max_token_length: int = 65804
+
+    def __post_init__(self):
+        _validate_max_token_length(self.max_token_length)
+
 
 @dataclass
 class TcpServerParameters(LoadStoreClass):
     """Parameters for setting up a :mod:`tcpserver <aiocoap.transports.tcpserver>` transport."""
+
+    max_token_length: int = 65804
+
+    def __post_init__(self):
+        _validate_max_token_length(self.max_token_length)
 
 
 @dataclass
 class TlsClientParameters(LoadStoreClass):
     """Parameters for setting up a :mod:`tlsclient <aiocoap.transports.tlsclient>` transport."""
 
+    max_token_length: int = 65804
+
+    def __post_init__(self):
+        _validate_max_token_length(self.max_token_length)
+
 
 @dataclass
 class TlsServerParameters(LoadStoreClass):
     """Parameters for setting up a :mod:`tlsserver <aiocoap.transports.tlsserver>` transport."""
 
+    max_token_length: int = 65804
+
+    def __post_init__(self):
+        _validate_max_token_length(self.max_token_length)
+
 
 @dataclass
 class WsParameters(LoadStoreClass):
     """Parameters for setting up a :mod:`ws <aiocoap.transports.ws>` transport."""
+
+    max_token_length: int = 65804
+
+    def __post_init__(self):
+        _validate_max_token_length(self.max_token_length)
 
 
 @dataclass

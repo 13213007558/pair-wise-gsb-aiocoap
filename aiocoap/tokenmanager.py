@@ -7,6 +7,7 @@ import random
 
 from . import error
 from . import interfaces
+from .numbers import constants
 
 from .pipe import Pipe
 
@@ -44,7 +45,7 @@ class TokenManager(interfaces.RequestInterface, interfaces.TokenManager):
     async def shutdown(self):
         while self.incoming_requests:
             key = next(iter(self.incoming_requests.keys()))
-            (_, stop) = self.incoming_requests.pop(key)
+            _, stop = self.incoming_requests.pop(key)
             # This cancels them, not sending anything.
             #
             # FIXME should we? (RST? 5.00 Server Shutdown? An RST would only
@@ -61,11 +62,13 @@ class TokenManager(interfaces.RequestInterface, interfaces.TokenManager):
 
         await self.token_interface.shutdown()
 
-    def next_token(self):
+    def next_token(self, length=8):
         """Reserve and return a new Token for request."""
-        # TODO: add proper Token handling
-        self._token = (self._token + 1) % (2**64)
-        return self._token.to_bytes(8, "big").lstrip(b"\0")
+        if length == 8:
+            # TODO: add proper Token handling
+            self._token = (self._token + 1) % (2**64)
+            return self._token.to_bytes(8, "big").lstrip(b"\0")
+        return random.randbytes(length)
 
     #
     # implement the tokenmanager interface
@@ -95,7 +98,7 @@ class TokenManager(interfaces.RequestInterface, interfaces.TokenManager):
         # batch
         stoppers = []
         for key, request in self.outgoing_requests.items():
-            (token, request_remote) = key
+            token, request_remote = key
             if request_remote == remote:
                 stoppers.append(
                     lambda request=request, exception=exception: request.add_exception(
@@ -118,7 +121,7 @@ class TokenManager(interfaces.RequestInterface, interfaces.TokenManager):
             # observation, which gets modelled as a new request at thislevel
             self.log.debug("Incoming request overrides existing request")
             # Popping: FIXME Decide if one of them is sufficient (see `del self.incoming_requests[key]` below)
-            (pipe, stop) = self.incoming_requests.pop(key)
+            pipe, stop = self.incoming_requests.pop(key)
             stop()
 
         pipe = Pipe(request, self.log)
@@ -232,7 +235,16 @@ class TokenManager(interfaces.RequestInterface, interfaces.TokenManager):
 
         # FIXME: pick a suitably short one where available, and a longer one
         # for observations if many short ones are already in-flight
-        msg.token = self.next_token()
+        token_length = min(
+            getattr(
+                msg.transport_tuning,
+                "token_length",
+                constants.MAX_TOKEN_LENGTH,
+            ),
+            msg.remote.max_supported_token_length,
+        )
+        token_length = max(1, token_length)
+        msg.token = self.next_token(token_length)
 
         self.log.debug(
             "Sending request - Token: %s, Remote: %s", msg.token.hex(), msg.remote

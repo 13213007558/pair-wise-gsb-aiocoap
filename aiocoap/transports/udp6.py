@@ -131,10 +131,20 @@ class UDP6EndpointAddress(interfaces.EndpointAddress):
     True
     """
 
-    def __init__(self, sockaddr, interface, *, pktinfo=None):
+    def __init__(
+        self,
+        sockaddr,
+        interface,
+        *,
+        pktinfo=None,
+        allow_extended_tokens=False,
+        max_token_length=constants.DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH,
+    ):
         self.sockaddr = sockaddr
         self.pktinfo = pktinfo
         self._interface = weakref.ref(interface)
+        if allow_extended_tokens:
+            self.set_extended_token_supported(True, max_token_length=max_token_length)
 
     scheme = "coap"
 
@@ -177,7 +187,9 @@ class UDP6EndpointAddress(interfaces.EndpointAddress):
         if self.sockaddr[3] != 0:
             try:
                 scopepart = "%" + socket.if_indextoname(self.sockaddr[3])
-            except Exception:  # could be an OS error, could just be that there is no function of this name, as it is on Android
+            except (
+                Exception
+            ):  # could be an OS error, could just be that there is no function of this name, as it is on Android
                 scopepart = "%" + str(self.sockaddr[3])
         else:
             scopepart = ""
@@ -282,7 +294,7 @@ class MessageInterfaceUDP6(RecvmsgDatagramProtocol, interfaces.MessageInterface)
     # Set between prepare_transport_endpoints and start_transport_endpoint
     _ctx: interfaces.MessageManager
 
-    def __init__(self, bind, log, loop):
+    def __init__(self, bind, log, loop, max_token_length, allow_extended_tokens):
         self.__bind = bind
         self.log = log
         self.loop = loop
@@ -291,7 +303,9 @@ class MessageInterfaceUDP6(RecvmsgDatagramProtocol, interfaces.MessageInterface)
             None  #: Future created and used in the .shutdown() method.
         )
 
-        self.ready = asyncio.get_running_loop().create_future()  #: Future that gets fulfilled by connection_made (ie. don't send before this is done; handled by ``create_..._context``
+        self.ready = (
+            asyncio.get_running_loop().create_future()
+        )  #: Future that gets fulfilled by connection_made (ie. don't send before this is done; handled by ``create_..._context``
 
         # This is set while a send is underway to determine in the
         # error_received call site whom we were actually sending something to.
@@ -304,6 +318,8 @@ class MessageInterfaceUDP6(RecvmsgDatagramProtocol, interfaces.MessageInterface)
         self._remote_being_sent_to = contextvars.ContextVar(
             "_remote_being_sent_to", default=None
         )
+        self._max_token_length = max_token_length
+        self._allow_extended_tokens = allow_extended_tokens
 
     def __repr__(self):
         socket = self.transport.get_extra_info("socket")
@@ -334,9 +350,9 @@ class MessageInterfaceUDP6(RecvmsgDatagramProtocol, interfaces.MessageInterface)
         still not be processed fully because the token and message manager are
         not fully set up."""
 
-        assert params.udp6 is not None, (
-            "Transport initiated without actual configuration"
-        )
+        assert (
+            params.udp6 is not None
+        ), "Transport initiated without actual configuration"
 
         bind = params.udp6.bind
         if bind is None and params._legacy_bind is not None:
@@ -352,7 +368,7 @@ class MessageInterfaceUDP6(RecvmsgDatagramProtocol, interfaces.MessageInterface)
             reuseport = defaults.has_reuse_port()
 
         for joined in bind:
-            (host, port) = hostportsplit(joined)
+            host, port = hostportsplit(joined)
             if port is None:
                 port = COAP_PORT
 
@@ -453,7 +469,15 @@ class MessageInterfaceUDP6(RecvmsgDatagramProtocol, interfaces.MessageInterface)
                             raise RuntimeError("Unknown address format")
 
                     transport, protocol = await create_recvmsg_datagram_endpoint(
-                        loop, lambda: cls(bind=address, log=log, loop=loop), sock=sock
+                        loop,
+                        lambda: cls(
+                            bind=address,
+                            log=log,
+                            loop=loop,
+                            max_token_length=params.udp6.max_token_length,
+                            allow_extended_tokens=params.udp6.allow_extended_tokens,
+                        ),
+                        sock=sock,
                     )
 
                     await protocol.ready
@@ -490,11 +514,12 @@ class MessageInterfaceUDP6(RecvmsgDatagramProtocol, interfaces.MessageInterface)
             ancdata.append(
                 (socket.IPPROTO_IPV6, socket.IPV6_PKTINFO, message.remote.pktinfo)
             )
-        assert self._remote_being_sent_to.get(None) is None, (
-            "udp6.MessageInterfaceUDP6.send was reentered in a single task"
-        )
+        assert (
+            self._remote_being_sent_to.get(None) is None
+        ), "udp6.MessageInterfaceUDP6.send was reentered in a single task"
         self._remote_being_sent_to.set(message.remote)
         try:
+            message.remote.check_outgoing_token(message)
             self.transport.sendmsg(
                 message.encode(), ancdata, 0, message.remote.sockaddr
             )
@@ -584,7 +609,13 @@ class MessageInterfaceUDP6(RecvmsgDatagramProtocol, interfaces.MessageInterface)
             local = None
 
         sockaddr = ip, port, flowinfo, scopeid
-        result = UDP6EndpointAddress(sockaddr, self, pktinfo=local)
+        result = UDP6EndpointAddress(
+            sockaddr,
+            self,
+            pktinfo=local,
+            allow_extended_tokens=self._allow_extended_tokens,
+            max_token_length=self._max_token_length,
+        )
         if request.remote.maximum_block_size_exp < result.maximum_block_size_exp:
             result.maximum_block_size_exp = request.remote.maximum_block_size_exp
         return result
@@ -620,12 +651,24 @@ class MessageInterfaceUDP6(RecvmsgDatagramProtocol, interfaces.MessageInterface)
             )
         try:
             message = Message.decode(
-                data, UDP6EndpointAddress(address, self, pktinfo=pktinfo)
+                data,
+                UDP6EndpointAddress(
+                    address,
+                    self,
+                    pktinfo=pktinfo,
+                    allow_extended_tokens=self._allow_extended_tokens,
+                    max_token_length=self._max_token_length,
+                ),
+                max_token_length=self._max_token_length,
             )
         except error.UnparsableMessage:
             self.log.warning("Ignoring unparsable message from %s", address)
             return
         message.direction = Direction.INCOMING
+        if len(message.token) > constants.MAX_TOKEN_LENGTH:
+            message.remote.set_extended_token_supported(
+                True, max_token_length=self._max_token_length
+            )
 
         try:
             self._ctx.dispatch_message(message)
@@ -639,15 +682,15 @@ class MessageInterfaceUDP6(RecvmsgDatagramProtocol, interfaces.MessageInterface)
             raise
 
     def datagram_errqueue_received(self, data, ancdata, flags, address):
-        assert flags == socknumbers.MSG_ERRQUEUE, (
-            "Received non-error data through the errqueue"
-        )
+        assert (
+            flags == socknumbers.MSG_ERRQUEUE
+        ), "Received non-error data through the errqueue"
         pktinfo = None
         errno_value = None
         for cmsg_level, cmsg_type, cmsg_data in ancdata:
-            assert cmsg_level == socket.IPPROTO_IPV6, (
-                "Received non-IPv6 protocol through the errqueue"
-            )
+            assert (
+                cmsg_level == socket.IPPROTO_IPV6
+            ), "Received non-IPv6 protocol through the errqueue"
             if cmsg_type == socknumbers.IPV6_RECVERR:
                 extended_err = SockExtendedErr.load(cmsg_data)
                 self.log.debug("Socket error received, details: %s", extended_err)

@@ -11,10 +11,18 @@ from aiocoap.transports import rfc8323common
 from aiocoap import interfaces, error, util
 from aiocoap import COAP_PORT, Message
 from aiocoap import defaults
-from aiocoap.message import Direction
+from aiocoap.numbers import constants
+from aiocoap.message import (
+    Direction,
+    encode_token_length,
+    read_token_length,
+)
 
 
-def _extract_message_size(data: bytes):
+def _extract_message_size(
+    data: bytes,
+    max_token_length=constants.DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH,
+):
     """Read out the full length of a CoAP message represented by data.
 
     Returns None if data is too short to read the (full) length.
@@ -26,15 +34,15 @@ def _extract_message_size(data: bytes):
     if not data:
         return None
 
-    length = data[0] >> 4
-    tokenoffset = 2
+    length_prefix = data[0] >> 4
+    token_offset = 2
     tkl = data[0] & 0x0F
 
-    if length >= 13:
-        if length == 13:
+    if length_prefix >= 13:
+        if length_prefix == 13:
             extlen = 1
             offset = 13
-        elif length == 14:
+        elif length_prefix == 14:
             extlen = 2
             offset = 269
         else:
@@ -42,21 +50,37 @@ def _extract_message_size(data: bytes):
             offset = 65805
         if len(data) < extlen + 1:
             return None
-        tokenoffset = 2 + extlen
+        token_offset = 2 + extlen
         length = int.from_bytes(data[1 : 1 + extlen], "big") + offset
-    return tokenoffset, tkl, length
+    else:
+        length = length_prefix
+
+    token_length_data = data[token_offset:]
+    required_extended_token_length = {13: 1, 14: 2, 15: 4}.get(tkl, 0)
+    if len(token_length_data) < required_extended_token_length:
+        return None
+
+    token_length, extended_token_length = read_token_length(
+        tkl, data, token_offset, max_token_length
+    )
+    if extended_token_length:
+        token_offset += len(extended_token_length)
+    return token_offset, token_length, length
 
 
-def _decode_message(data: bytes) -> Message:
-    tokenoffset, tkl, _ = _extract_message_size(data)
-    if tkl > 8:
-        raise error.UnparsableMessage("Overly long token")
-    code = data[tokenoffset - 1]
-    token = data[tokenoffset : tokenoffset + tkl]
+def _decode_message(
+    data: bytes,
+    max_token_length=constants.DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH,
+) -> Message:
+    token_offset, token_length, _ = _extract_message_size(data, max_token_length)
+    if len(data) < token_offset + token_length:
+        raise error.UnparsableMessage("Token ended prematurely")
+    code = data[token_offset - 1]
+    token = data[token_offset : token_offset + token_length]
 
     msg = Message(code=code, _token=token)
 
-    msg.payload = msg.opt.decode(data[tokenoffset + tkl :])
+    msg.payload = msg.opt.decode(data[token_offset + token_length :])
     msg.direction = Direction.INCOMING
 
     return msg
@@ -78,14 +102,18 @@ def _serialize(msg: Message) -> bytes:
     if msg.payload:
         data_list += [b"\xff", msg.payload]
     data = b"".join(data_list)
-    length, extlen = _encode_length(len(data))
-
-    tkl = len(msg.token)
-    if tkl > 8:
-        raise ValueError("Overly long token")
+    length, extended_length = _encode_length(len(data))
+    tkl, extended_token_length = encode_token_length(len(msg.token))
 
     return b"".join(
-        (bytes(((length << 4) | tkl,)), extlen, bytes((msg.code,)), msg.token, data)
+        (
+            bytes(((length << 4) | tkl,)),
+            extended_length,
+            bytes((msg.code,)),
+            extended_token_length,
+            msg.token,
+            data,
+        )
     )
 
 
@@ -97,7 +125,7 @@ class TcpConnection(
     # depend on whether the library user still keeps a usable address around,
     # those functions could be split.
 
-    def __init__(self, ctx, log, loop, *, is_server) -> None:
+    def __init__(self, ctx, log, loop, *, is_server, max_token_length=None) -> None:
         super().__init__()
         self._ctx = ctx
         self.log = log
@@ -109,6 +137,8 @@ class TcpConnection(
 
         self._transport: Optional[asyncio.Transport] = None
         self._local_is_server = is_server
+        if max_token_length is not None:
+            self._my_max_token_length = max_token_length
 
     @property
     def scheme(self):
@@ -116,9 +146,10 @@ class TcpConnection(
 
     def _send_message(self, msg: Message):
         self.log.debug("Sending message: %r", msg)
-        assert self._transport is not None, (
-            "Attempted to send message before connection"
-        )
+        assert (
+            self._transport is not None
+        ), "Attempted to send message before connection"
+        self._check_outgoing_token(msg)
         self._transport.write(_serialize(msg))
 
     def _abort_with(self, abort_msg):
@@ -186,7 +217,14 @@ class TcpConnection(
         self._spool += data
 
         while True:
-            msglen = _extract_message_size(self._spool)
+            try:
+                msglen = _extract_message_size(
+                    self._spool,
+                    self._my_max_token_length,
+                )
+            except error.UnparsableMessage:
+                self.abort("Overly long token")
+                return
             if msglen is None:
                 break
             msglen = sum(msglen)
@@ -199,7 +237,7 @@ class TcpConnection(
 
             msg = self._spool[:msglen]
             try:
-                msg = _decode_message(msg)
+                msg = _decode_message(msg, self._my_max_token_length)
             except error.UnparsableMessage:
                 self.abort("Failed to parse message")
                 return
@@ -291,6 +329,8 @@ class _TCPPooling:
 
 
 class TCPServer(_TCPPooling, interfaces.TokenInterface):
+    _max_token_length = constants.DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH
+
     def __init__(self) -> None:
         self._pool: Set[TcpConnection] = set()
         self.log: Optional[Logger] = None
@@ -298,23 +338,39 @@ class TCPServer(_TCPPooling, interfaces.TokenInterface):
 
     @classmethod
     async def create_server(
-        cls, bind, tman: interfaces.TokenManager, log, loop, *, _server_context=None
+        cls,
+        bind,
+        tman: interfaces.TokenManager,
+        log,
+        loop,
+        *,
+        _server_context=None,
+        max_token_length=constants.DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH,
     ):
         self = cls()
         self._tokenmanager = tman
         self.log = log
+        self._max_token_length = max_token_length
         # self.loop = loop
 
         bind = bind or ("::", None)
         bind = (
             bind[0],
-            bind[1] + (self._default_port - COAP_PORT)
-            if bind[1]
-            else self._default_port,
+            (
+                bind[1] + (self._default_port - COAP_PORT)
+                if bind[1]
+                else self._default_port
+            ),
         )
 
         def new_connection():
-            c = TcpConnection(self, log, loop, is_server=True)
+            c = TcpConnection(
+                self,
+                log,
+                loop,
+                is_server=True,
+                max_token_length=self._max_token_length,
+            )
             self._pool.add(c)
             return c
 
@@ -373,15 +429,16 @@ class TCPServer(_TCPPooling, interfaces.TokenInterface):
 
 class TCPClient(_TCPPooling, interfaces.TokenInterface):
     def __init__(self) -> None:
-        self._pool: Dict[
-            Tuple[str, int], TcpConnection
-        ] = {}  #: (host, port) -> connection
+        self._pool: Dict[Tuple[str, int], TcpConnection] = (
+            {}
+        )  #: (host, port) -> connection
         # note that connections are filed by host name, so different names for
         # the same address might end up with different connections, which is
         # probably okay for TCP, and crucial for later work with TLS.
         self.log: Optional[Logger] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.credentials = None
+        self._max_token_length = constants.DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH
 
     async def _spawn_protocol(self, message):
         if message.unresolved_remote is None:
@@ -400,7 +457,13 @@ class TCPClient(_TCPPooling, interfaces.TokenInterface):
 
         try:
             _, protocol = await self.loop.create_connection(
-                lambda: TcpConnection(self, self.log, self.loop, is_server=False),
+                lambda: TcpConnection(
+                    self,
+                    self.log,
+                    self.loop,
+                    is_server=False,
+                    max_token_length=self._max_token_length,
+                ),
                 host,
                 port,
                 ssl=self._ssl_context_factory(message.unresolved_remote),
@@ -412,6 +475,7 @@ class TCPClient(_TCPPooling, interfaces.TokenInterface):
         except OSError as e:
             raise error.NetworkError("Connection failed to %r" % host) from e
 
+        await protocol.wait_for_remote_settings()
         self._pool[(host, port)] = protocol
 
         return protocol
@@ -431,7 +495,12 @@ class TCPClient(_TCPPooling, interfaces.TokenInterface):
 
     @classmethod
     async def create_client_transport(
-        cls, tman: interfaces.TokenManager, log, loop, credentials=None
+        cls,
+        tman: interfaces.TokenManager,
+        log,
+        loop,
+        credentials=None,
+        max_token_length=constants.DEFAULT_MAX_RECEIVED_EXTENDED_TOKEN_LENGTH,
     ):
         # this is not actually asynchronous, and even though the interface
         # between the context and the creation of interfaces is not fully
@@ -442,6 +511,7 @@ class TCPClient(_TCPPooling, interfaces.TokenInterface):
         self.loop = loop
         # used by the TLS variant; FIXME not well thought through
         self.credentials = credentials
+        self._max_token_length = max_token_length
 
         return self
 
