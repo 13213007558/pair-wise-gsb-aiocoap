@@ -81,7 +81,19 @@ class OscoreSiteWrapper(interfaces.Resource):
                 return
 
         try:
-            unprotected, seqno = sc.unprotect(request)
+            try:
+                unprotected, seqno = sc.unprotect(request)
+            except Exception as e:
+                if isinstance(sc, edhoc.EdhocResponderContext) and sc._incomplete:
+                    # A failed EDHOC message 3 leaves the underlying (lakers)
+                    # state machine unusable, so the context could never
+                    # complete. Drop it instead of leaving half-authenticated
+                    # state (and its connection identifier) around.
+                    self._discard_failed_edhoc_context(sc)
+                    if not isinstance(e, error.RenderableError):
+                        self.log.info("EDHOC handshake failed: %r", e)
+                        raise error.BadRequest("EDHOC handshake failed")
+                raise
         except error.RenderableError as e:
             # Note that this is flying out of the unprotection (ie. the
             # security context), which is trusted to not leak unintended
@@ -318,11 +330,29 @@ class OscoreSiteWrapper(interfaces.Resource):
         if not isinstance(sc, edhoc.EdhocResponderContext):
             raise error.BadRequest
 
-        message_4 = sc._offer_message_3(message_3)
+        try:
+            message_4 = sc._offer_message_3(message_3)
+        except Exception as e:
+            self._discard_failed_edhoc_context(sc)
+            if isinstance(e, error.RenderableError):
+                raise
+            self.log.info("EDHOC handshake failed: %r", e)
+            raise error.BadRequest("EDHOC handshake failed")
 
         pipe.add_response(
             aiocoap.Message(code=aiocoap.CHANGED, payload=message_4), is_last=True
         )
+
+    def _discard_failed_edhoc_context(self, sc):
+        """Remove a failed EDHOC responder context from the credentials map.
+
+        Called when processing message 3 raised; the context can not make
+        progress any more (the underlying EDHOC state machine does not
+        tolerate retries), and keeping it would leave half-authenticated
+        state around and squat on its connection identifier."""
+        for key, value in list(self.server_credentials.items()):
+            if value is sc:
+                del self.server_credentials[key]
 
     def _get_edhoc_identity(self, origin: str) -> Optional[edhoc.EdhocCredentials]:
         """With lakers-python 0.3.1, we can effectively only have one identity

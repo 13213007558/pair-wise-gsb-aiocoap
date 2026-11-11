@@ -650,9 +650,12 @@ class EdhocResponderContext(_EdhocContextBase):
                 )
                 raise error.BadRequest
 
-            self.authenticated_claims.extend(claims)
-
             self._responder.verify_message_3(cred_i)
+
+            # Only attach any claims once the peer has actually proven
+            # possession of the credential they were looked up from; anything
+            # recorded earlier would survive a failed verification.
+            self.authenticated_claims.extend(claims)
             self._message_4 = self._responder.prepare_message_4(
                 self.grease_settings.grease_ead([])
             )
