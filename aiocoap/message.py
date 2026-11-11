@@ -386,6 +386,12 @@ class Message:
         option numbers that are not technically NoCacheKey but handled by the
         application using this method).
 
+        Options marked NoCacheKey (a property only defined for Safe-to-Forward
+        options) are left out of the key; this is the only place where that
+        property takes effect -- in particular, it says nothing about whether
+        an option may be forwarded by a proxy. Unsafe-to-Forward options are
+        always part of the key.
+
         >>> from aiocoap.numbers import GET
         >>> m1 = Message(code=GET)
         >>> m2 = Message(code=GET)

@@ -4,7 +4,40 @@
 
 """Basic implementation of CoAP-CoAP proxying
 
-This is work in progress and not yet part of the API."""
+This is work in progress and not yet part of the API.
+
+Unknown option policy
+---------------------
+
+CoAP options carry three orthogonal property bits (see RFC 7252, Section
+5.4.6), and this proxy keeps them strictly apart:
+
+* **Critical vs. elective** tells whether an option must be understood to
+  process the message correctly at all.
+* **Unsafe-to-Forward vs. Safe-to-Forward** tells whether a proxy that does
+  not understand an option may still forward it.
+* **NoCacheKey** tells whether an option contributes to the cache key. It is
+  only defined for Safe-to-Forward options, and only concerns caching --
+  never forwarding.
+
+The proxy applies the following rules:
+
+1. Options known to the proxy (the Uri-* family, Proxy-Scheme, Block1 and
+   Block2, Observe, and whatever a redirector passes to `raise_unless_safe`)
+   are processed according to their semantics; in particular, Proxy-Scheme
+   and Uri-Host are consumed to build the outgoing request's remote.
+2. Unknown Safe-to-Forward options (critical or elective) are forwarded
+   verbatim: their values are carried as opaque bytes, so no normalization
+   is applied to them, and repeats keep their order.
+3. Unknown Unsafe-to-Forward options make the request fail with 4.02 Bad
+   Option (see `raise_unless_safe`) before anything is forwarded. This is
+   stricter than the minimum of RFC 7252 (which would also allow silently
+   dropping unknown *elective* unsafe options), but always compliant and
+   easier to debug.
+4. NoCacheKey options are forwarded like any other safe option; their
+   special meaning only takes effect when cache keys are computed (see
+   `Message.get_cache_key`), where they are left out of the key.
+"""
 
 import asyncio
 import functools
@@ -54,7 +87,15 @@ class CanNotRedirectBecauseOfUnsafeOptions(CanNotRedirect):
 
 def raise_unless_safe(request, known_options):
     """Raise a BAD_OPTION CanNotRedirect unless all options in request are
-    safe to forward or known"""
+    safe to forward or known.
+
+    This enforces rule 3 of the unknown option policy described in the module
+    docstring: any option marked Unsafe-to-Forward that the proxy does not
+    know (neither handled by the proxy infrastructure nor listed in
+    known_options) fails the request with 4.02 Bad Option before it is
+    forwarded. Safe-to-Forward options pass unchecked and are forwarded
+    verbatim. NoCacheKey plays no role here; it only affects cache key
+    computation in `Message.get_cache_key`."""
 
     known_options = set(known_options).union(
         {
