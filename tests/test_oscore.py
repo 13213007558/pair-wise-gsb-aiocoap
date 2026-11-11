@@ -7,6 +7,7 @@
 import unittest
 
 import aiocoap
+import aiocoap.defaults
 
 oscore_modules = aiocoap.defaults.oscore_missing_modules()
 
@@ -661,6 +662,395 @@ class TestOSCORECompression(unittest.TestCase):
         self.assertRaises(
             RuntimeError, lambda: self.compare_compress(None, None, {}, {"x": "y"}, b"")
         )
+
+
+@_skip_unless_oscore
+class TestOSCORERequestResponseBinding(unittest.TestCase):
+    """Negative tests for OSCORE request-response binding (RFC 8613 Sections
+    7.4 and 8.1): when two requests are in flight simultaneously over the
+    same security context, their response ciphertexts must not be
+    interchangeable.
+
+    The cryptographic binding is provided exclusively through the external
+    AAD inputs request_kid and request_piv (see
+    ``BaseSecurityContext._extract_external_aad``; the remaining AAD inputs
+    are the OSCORE version, the algorithm list and the Class I options, all
+    of which are constant here). The CoAP token and the other outer options
+    are transport-layer concerns and are *not* authenticated by OSCORE.
+
+    The tests therefore distinguish authentication failures (ProtectionInvalid
+    raised from AEAD tag verification) from transport-layer deduplication
+    (ReplayError raised from the replay window, or token/MID matching that
+    happens outside this module), and map out the AAD coverage by varying the
+    requests' Partial IV, token and Uri-Path independently.
+    """
+
+    def _context_pair(self):
+        """Build a client and a server security context on the RFC 8613 C.1
+        key material, with replay windows initialized so that server-side
+        request processing behaves like in a real deployment."""
+
+        client = NonsavingSecurityContext()
+        client.alg_aead = default_algorithm
+        client.hashfun = default_hashfun
+        client.sender_id = b""
+        client.recipient_id = b"\x01"
+        client.id_context = None
+        client.derive_keys(C1_SALT, C1_KEY)
+
+        server = NonsavingSecurityContext()
+        server.alg_aead = default_algorithm
+        server.hashfun = default_hashfun
+        server.sender_id = b"\x01"
+        server.recipient_id = b""
+        server.id_context = None
+        server.derive_keys(C1_SALT, C1_KEY)
+
+        for context in (client, server):
+            context.sender_sequence_number = 0
+            context.echo_recovery = None
+            context.recipient_replay_window = aiocoap.oscore.ReplayWindow(
+                aiocoap.oscore.DEFAULT_WINDOWSIZE, lambda: None
+            )
+            context.recipient_replay_window.initialize_empty()
+
+        return client, server
+
+    @staticmethod
+    def _outgoing(code, token=b"", uri_path=None, payload=b""):
+        message = aiocoap.Message(code=code, payload=payload)
+        message.token = token
+        if uri_path is not None:
+            message.opt.uri_path = tuple(uri_path.split("/"))
+        message.direction = aiocoap.message.Direction.OUTGOING
+        return message
+
+    @staticmethod
+    def _incoming(message):
+        message.direction = aiocoap.message.Direction.INCOMING
+        return message
+
+    def _protect_request(self, client, request):
+        protected, request_id = client.protect(request)
+        # The token travels in the outer message; carrying it over is the
+        # transport's job, the OSCORE module does not touch it.
+        protected.token = request.token
+        return self._incoming(protected), request_id
+
+    def _respond(self, server, protected_request, payload, response_has_own_piv):
+        inner_request, server_request_id = server.unprotect(protected_request)
+        if response_has_own_piv:
+            # Legal alternative to reusing the request's Partial IV: the
+            # server answers with a fresh sequence number of its own.
+            server_request_id.can_reuse_nonce = False
+        response = self._outgoing(aiocoap.CONTENT, payload=payload)
+        protected_response, _ = server.protect(response, server_request_id)
+        protected_response.token = protected_request.token
+        return inner_request, self._incoming(protected_response)
+
+    def assertResponseRejected(self, context, protected_response, request_id):
+        """Assert that unprotecting a response fails with an AEAD
+        authentication error -- and not with a replay-window (transport
+        dedup) error, which would indicate the failure is not in the
+        cryptographic binding."""
+        with self.assertRaises(aiocoap.oscore.ProtectionInvalid) as caught:
+            context.unprotect(protected_response, request_id)
+        self.assertNotIsInstance(
+            caught.exception,
+            aiocoap.oscore.ReplayError,
+            "Failure was replay detection, not authentication",
+        )
+
+    def test_interleaved_requests_response_swap(self):
+        """Two requests are in flight at the same time on one security
+        context (interleaved: both are protected before any response is
+        processed). Their responses -- in both legal forms, with and without
+        an own Partial IV -- must not verify under the other request's
+        identifiers."""
+        for own_piv in (False, True):
+            with self.subTest(response_has_own_piv=own_piv):
+                client, server = self._context_pair()
+
+                request1 = self._outgoing(aiocoap.GET, token=b"\x01", uri_path="a")
+                request2 = self._outgoing(aiocoap.GET, token=b"\x02", uri_path="b")
+
+                protected1, client_rid1 = self._protect_request(client, request1)
+                protected2, client_rid2 = self._protect_request(client, request2)
+
+                # The requests differ in Partial IV, token and Uri-Path.
+                self.assertNotEqual(protected1.opt.oscore, protected2.opt.oscore)
+
+                inner1, response1 = self._respond(server, protected1, b"answer-a", own_piv)
+                inner2, response2 = self._respond(server, protected2, b"answer-b", own_piv)
+
+                self.assertEqual(inner1.opt.uri_path, ("a",))
+                self.assertEqual(inner2.opt.uri_path, ("b",))
+
+                # The response has the requested legal form.
+                if own_piv:
+                    self.assertNotEqual(response1.opt.oscore, b"")
+                    self.assertNotEqual(response2.opt.oscore, b"")
+                else:
+                    self.assertEqual(response1.opt.oscore, b"")
+                    self.assertEqual(response2.opt.oscore, b"")
+
+                # Swapped: a response ciphertext must not be accepted as the
+                # other request's answer. (The differing tokens would let the
+                # transport tell them apart, but the property tested here is
+                # purely cryptographic.)
+                self.assertResponseRejected(client, response1, client_rid2)
+                self.assertResponseRejected(client, response2, client_rid1)
+
+                # The correct assignment still verifies, proving the messages
+                # themselves were well-formed.
+                unprotected1, _ = client.unprotect(response1, client_rid1)
+                unprotected2, _ = client.unprotect(response2, client_rid2)
+                self.assertEqual(unprotected1.payload, b"answer-a")
+                self.assertEqual(unprotected2.payload, b"answer-b")
+
+    def test_partial_iv_is_the_binding_input(self):
+        """Requests that differ only in their Partial IV (same token, same
+        path) already produce non-interchangeable responses: request_kid and
+        request_piv are the AAD inputs that bind a response to its request."""
+        client, server = self._context_pair()
+
+        request1 = self._outgoing(aiocoap.GET, token=b"\x01", uri_path="same")
+        request2 = self._outgoing(aiocoap.GET, token=b"\x01", uri_path="same")
+
+        protected1, client_rid1 = self._protect_request(client, request1)
+        protected2, client_rid2 = self._protect_request(client, request2)
+
+        _, response1 = self._respond(server, protected1, b"one", False)
+        _, response2 = self._respond(server, protected2, b"two", False)
+
+        self.assertResponseRejected(client, response1, client_rid2)
+        self.assertResponseRejected(client, response2, client_rid1)
+
+    def test_token_is_not_cryptographically_bound(self):
+        """The token is not an input to the external AAD: two requests that
+        differ only in their token (with forced identical Partial IVs, which
+        a real sender must never produce as sequence numbers must not be
+        reused) yield cryptographically interchangeable responses.
+
+        This documents that matching tokens must not be mistaken for
+        cryptographic request-response binding; telling such requests apart
+        is entirely the transport layer's task."""
+        client, server = self._context_pair()
+
+        request1 = self._outgoing(aiocoap.GET, token=b"\x01", uri_path="same")
+        request2 = self._outgoing(aiocoap.GET, token=b"\x02", uri_path="same")
+
+        protected1, client_rid1 = self._protect_request(client, request1)
+        # Deliberate sequence number reuse to isolate the token dimension;
+        # only the NonsavingSecurityContext tolerates this.
+        client.sender_sequence_number = 0
+        protected2, client_rid2 = self._protect_request(client, request2)
+
+        self.assertEqual(protected1.opt.oscore, protected2.opt.oscore)
+
+        # The server side is constructed manually: unprotecting the second
+        # request would (correctly) be caught by the replay window, which is
+        # a different layer than the one under test here.
+        server_rid1 = aiocoap.oscore.RequestIdentifiers(b"", b"\x00", True, aiocoap.POST)
+        server_rid2 = aiocoap.oscore.RequestIdentifiers(b"", b"\x00", True, aiocoap.POST)
+
+        response1 = self._outgoing(aiocoap.CONTENT, payload=b"one")
+        protected_response1, _ = server.protect(response1, server_rid1)
+        response2 = self._outgoing(aiocoap.CONTENT, payload=b"two")
+        protected_response2, _ = server.protect(response2, server_rid2)
+
+        # A response to either request verifies under the other request's
+        # identifiers: nothing in the AAD reflects the token.
+        unprotected, _ = client.unprotect(
+            self._incoming(protected_response1), client_rid2
+        )
+        self.assertEqual(unprotected.payload, b"one")
+        unprotected, _ = client.unprotect(
+            self._incoming(protected_response2), client_rid1
+        )
+        self.assertEqual(unprotected.payload, b"two")
+
+    def test_uri_path_is_not_an_aad_input(self):
+        """Like the token, the Uri-Path is not an input to the response's
+        external AAD (it is only protected inside the request ciphertext):
+        with forced identical Partial IVs, responses to requests for
+        different paths are cryptographically interchangeable. The binding
+        relies on sequence number uniqueness, not on the request's contents."""
+        client, server = self._context_pair()
+
+        request1 = self._outgoing(aiocoap.GET, token=b"\x01", uri_path="a")
+        request2 = self._outgoing(aiocoap.GET, token=b"\x01", uri_path="b")
+
+        protected1, client_rid1 = self._protect_request(client, request1)
+        client.sender_sequence_number = 0  # deliberate reuse, see above
+        protected2, client_rid2 = self._protect_request(client, request2)
+
+        server_rid1 = aiocoap.oscore.RequestIdentifiers(b"", b"\x00", True, aiocoap.POST)
+        server_rid2 = aiocoap.oscore.RequestIdentifiers(b"", b"\x00", True, aiocoap.POST)
+
+        response1 = self._outgoing(aiocoap.CONTENT, payload=b"answer-a")
+        protected_response1, _ = server.protect(response1, server_rid1)
+        response2 = self._outgoing(aiocoap.CONTENT, payload=b"answer-b")
+        protected_response2, _ = server.protect(response2, server_rid2)
+
+        unprotected, _ = client.unprotect(
+            self._incoming(protected_response1), client_rid2
+        )
+        self.assertEqual(unprotected.payload, b"answer-a")
+        unprotected, _ = client.unprotect(
+            self._incoming(protected_response2), client_rid1
+        )
+        self.assertEqual(unprotected.payload, b"answer-b")
+
+    def test_outer_modifications(self):
+        """Modifications of the Object-Security option and the ciphertext are
+        authentication failures; modifications of the token or other outer
+        options are not detected by OSCORE at all and are left to the
+        transport layer."""
+        client, server = self._context_pair()
+
+        request = self._outgoing(aiocoap.GET, token=b"\x01", uri_path="a")
+        protected_request, client_rid = self._protect_request(client, request)
+        _, response = self._respond(server, protected_request, b"answer", True)
+
+        unprotected, _ = client.unprotect(response, client_rid)
+        self.assertEqual(unprotected.payload, b"answer")
+
+        def tampered():
+            return response.copy()
+
+        # Flipping a bit in the Partial IV of the Object-Security option
+        # changes the nonce and fails AEAD verification.
+        modified = tampered()
+        modified.opt.oscore = b"\x01\x01"
+        self.assertResponseRejected(client, modified, client_rid)
+
+        # Flipping a bit in the ciphertext invalidates the tag.
+        modified = tampered()
+        modified.payload = modified.payload[:-1] + bytes(
+            [modified.payload[-1] ^ 0x01]
+        )
+        self.assertResponseRejected(client, modified, client_rid)
+
+        # Changing the token is not detected: the token is not authenticated
+        # by OSCORE, matching it is the transport layer's task.
+        modified = tampered()
+        modified.token = b"\x02"
+        unprotected, _ = client.unprotect(modified, client_rid)
+        self.assertEqual(unprotected.payload, b"answer")
+
+        # Adding an unrelated outer option is not detected either; only
+        # Class I options (of which there are none here) enter the AAD.
+        modified = tampered()
+        modified.opt.etag = b"\xff"
+        unprotected, _ = client.unprotect(modified, client_rid)
+        self.assertEqual(unprotected.payload, b"answer")
+
+    def test_replayed_request_is_replay_error(self):
+        """Transport-layer deduplication is a different failure from
+        authentication: unprotecting the same request twice raises
+        ReplayError from the replay window, while all the swapped-response
+        cases above raise ProtectionInvalid that is not a ReplayError."""
+        client, server = self._context_pair()
+
+        request = self._outgoing(aiocoap.GET, token=b"\x01", uri_path="a")
+        protected_request, _ = self._protect_request(client, request)
+
+        server.unprotect(protected_request)
+        with self.assertRaises(aiocoap.oscore.ReplayError):
+            server.unprotect(protected_request)
+
+    def test_consumed_response_context(self):
+        """A request identifier's reusable nonce is consumed by the first
+        response protected with it; a second response protected with the same
+        (already consumed) identifiers automatically carries its own Partial
+        IV. Unprotecting the same consumed no-PIV response twice still
+        verifies -- response deduplication is a transport-layer task and not
+        something the cryptographic binding provides."""
+        client, server = self._context_pair()
+
+        request = self._outgoing(aiocoap.GET, token=b"\x01", uri_path="a")
+        protected_request, client_rid = self._protect_request(client, request)
+        _, server_rid = server.unprotect(protected_request)
+
+        response1 = self._outgoing(aiocoap.CONTENT, payload=b"first")
+        protected_response1, _ = server.protect(response1, server_rid)
+        # The first response reuses the request's Partial IV.
+        self.assertEqual(protected_response1.opt.oscore, b"")
+
+        response2 = self._outgoing(aiocoap.CONTENT, payload=b"second")
+        protected_response2, _ = server.protect(response2, server_rid)
+        # The consumed context can no longer reuse the nonce and sends its
+        # own Partial IV.
+        self.assertNotEqual(protected_response2.opt.oscore, b"")
+
+        unprotected, _ = client.unprotect(
+            self._incoming(protected_response1), client_rid
+        )
+        self.assertEqual(unprotected.payload, b"first")
+        unprotected, _ = client.unprotect(
+            self._incoming(protected_response2), client_rid
+        )
+        self.assertEqual(unprotected.payload, b"second")
+
+        # Re-unprotecting the consumed response verifies again: nothing
+        # cryptographic stops a replayed response, so the transport has to
+        # deduplicate (by token/MID) -- token equality with an earlier
+        # exchange is not proof of a fresh cryptographic binding.
+        unprotected, _ = client.unprotect(
+            self._incoming(protected_response1), client_rid
+        )
+        self.assertEqual(unprotected.payload, b"first")
+
+    def test_rfc8613_response_vectors(self):
+        """Independent protocol vectors anchoring the tests above: the
+        RFC 8613 C.7 (response reusing the request's Partial IV) and C.8
+        (response with its own Partial IV) protected responses verify under
+        the request identifiers of the C.4 request (Partial IV 0x14, empty
+        sender ID), and are rejected under mismatched ones -- covering the
+        request_piv AAD input in both legal response forms."""
+        secctx = NonsavingSecurityContext()
+        secctx.alg_aead = default_algorithm
+        secctx.hashfun = default_hashfun
+        secctx.sender_id = b""
+        secctx.recipient_id = b"\x01"
+        secctx.id_context = None
+        secctx.derive_keys(C1_SALT, C1_KEY)
+        secctx.sender_sequence_number = 0
+        secctx.echo_recovery = None
+        secctx.recipient_replay_window = aiocoap.oscore.ReplayWindow(
+            aiocoap.oscore.DEFAULT_WINDOWSIZE, lambda: None
+        )
+        secctx.recipient_replay_window.initialize_empty()
+
+        request_id = aiocoap.oscore.RequestIdentifiers(b"", b"\x14", None, aiocoap.POST)
+
+        protected_c7 = self._incoming(
+            aiocoap.Message.decode(
+                h("64445d1f0000397490ffdbaad1e9a7e7b2a813d3c31524378303cdafae119106")
+            )
+        )
+        unprotected, _ = secctx.unprotect(protected_c7, request_id)
+        self.assertEqual(unprotected.code, aiocoap.CONTENT)
+        self.assertEqual(unprotected.payload, b"Hello World!")
+
+        protected_c8 = self._incoming(
+            aiocoap.Message.decode(
+                h("64445d1f00003974920100ff4d4c13669384b67354b2b6175ff4b8658c666a6cf88e")
+            )
+        )
+        unprotected, _ = secctx.unprotect(protected_c8, request_id)
+        self.assertEqual(unprotected.code, aiocoap.CONTENT)
+        self.assertEqual(unprotected.payload, b"Hello World!")
+
+        # The same responses under the request identifiers of a different
+        # request (Partial IV 0x15) fail authentication -- the request's
+        # Partial IV enters the AAD even when the response carries its own.
+        mismatched_id = aiocoap.oscore.RequestIdentifiers(
+            b"", b"\x15", None, aiocoap.POST
+        )
+        self.assertResponseRejected(secctx, protected_c7, mismatched_id)
+        self.assertResponseRejected(secctx, protected_c8, mismatched_id)
 
 
 @_skip_unless_oscore
