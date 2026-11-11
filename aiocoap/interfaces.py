@@ -246,6 +246,22 @@ class TokenInterface(metaclass=abc.ABCMeta):
         call in case it no longer needs the message sent, and to dispose of if
         it doesn't intend to any more.
 
+        The returned callable is a *local* cancellation hook and must be safe
+        (and idempotent) to call at any phase of the exchange:
+
+        * While the message is still waiting in a transport-level queue (for
+          example the per-remote NSTART backlog of an unreliable transport) and
+          has not been put on the wire, calling it revokes the message: it is
+          dropped from the queue without being transmitted and without
+          disturbing any other queued message, in-flight exchange,
+          retransmission timer or congestion-control slot.
+        * Once the message has been transmitted, calling it only ends the
+          caller's local interest. It must not stop retransmissions, tear down
+          the exchange or release a congestion slot early: the peer may already
+          have received and acted on the message. CoAP has no mechanism for
+          withdrawing a transmitted message or its remote side effects.
+        * After the exchange has concluded, calling it is a no-op.
+
         messageerror_monitor is a function that will be called at most once by
         the token interface: When the underlying layer is indicating that this
         concrete message could not be processed. This is typically the case for

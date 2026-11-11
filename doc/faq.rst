@@ -96,3 +96,27 @@ while it is not clear where to better put them).
   Explicitly re-implementing everything on v4 would not only be needless extra work,
   it would also be a portability problem as unlike for IPv6, the interfaces are not specified platform independenlty for IPv4.
   Moreover, that mode would be error prone because it wouldn't receive regular testing.
+
+* **What does cancelling a request actually do?**
+
+  Cancelling a request (for example by cancelling its
+  :attr:`~aiocoap.protocol.Request.response` future) stops the local waiting
+  for a result. What it can guarantee depends on how far the request has
+  progressed on an unreliable (CoAP-over-UDP style) transport:
+
+  * If the confirmable message is still queued locally because another
+    exchange to the same device is in flight (the CoAP NSTART limit), it has
+    never been put on the wire. Cancelling removes it from that queue, so it
+    is never transmitted -- this is the only phase in which a command can be
+    revoked with certainty. Other queued requests and the in-flight exchange
+    are unaffected, and requests to other devices are never blocked.
+  * If the confirmable message has already been sent, cancellation only ends
+    the local wait. The message exchange and its retransmissions continue,
+    and its congestion-control slot is kept until it concludes.
+
+  Consequently, cancelling an already transmitted request -- in particular a
+  non-idempotent command such as a PUT or POST -- does **not** undo, prevent or
+  withdraw any effect it may have had on the remote device. The datagram may
+  already have arrived and been acted on, and CoAP provides no mechanism for
+  recalling a sent message. Applications that need to undo a remote effect
+  must send an explicit compensating request instead.

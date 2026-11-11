@@ -7,6 +7,28 @@ transports, ie. everything that deals in message types or Message IDs.
 
 Currently, it also provides the mechanisms for managing tokens, but those will
 be split into dedicated classes.
+
+Cancellation
+~~~~~~~~~~~~
+
+Outgoing confirmable messages pass through three phases, and request
+cancellation (see the send canceller returned by :meth:`send_message`) has
+different guarantees in each:
+
+1. *Backlogged* -- NSTART (RFC 7252) allows only one outstanding CON exchange
+   per remote, so later messages wait in ``_backlogs`` and have never touched
+   the wire. A cancellation here is a hard, guaranteed revocation: the exact
+   backlog entry is removed without affecting neighboring entries, the active
+   exchange or any timer.
+2. *In flight* -- the message was sent and ``_active_exchanges`` is running its
+   retransmission timers. Cancellation ends only the local wait. The exchange
+   keeps running untouched, because the datagram (and thus any non-idempotent
+   command it carries) may already have reached the peer; there is no way to
+   withdraw a transmitted message or its remote effects.
+3. *Concluded* -- an ACK/RST already removed the exchange; cancellation is a
+   no-op.
+
+Only phase 1 guarantees that no remote side effect can occur.
 """
 
 import asyncio
@@ -51,7 +73,10 @@ class MessageManager(interfaces.TokenInterface, interfaces.MessageManager):
             Tuple[EndpointAddress, int], Tuple[Callable[[], None], asyncio.Handle]
         ] = {}
         #: Per-remote list of (backlogged package, messageerror_monitor)
-        #: tuples (keys exist iff there is an active_exchange with that node)
+        #: tuples (keys exist iff there is an active_exchange with that node).
+        #: Entries in here have not been transmitted yet, so removing one via
+        #: its send canceller is the only phase in which a request can be
+        #: revoked with the guarantee that no remote side effect happens.
         self._backlogs: Dict[
             EndpointAddress, List[Tuple[Message, Callable[[], None]]]
         ] = {}
@@ -495,14 +520,87 @@ class MessageManager(interfaces.TokenInterface, interfaces.MessageManager):
         if message.mid is None:
             message.mid = self._next_message_id()
 
+        send_canceller = None
+        if message.mtype == CON:
+            send_canceller, messageerror_monitor, state = self._make_send_canceller(
+                message, messageerror_monitor
+            )
+
         if message.mtype == CON and message.remote in self._backlogs:
             assert any(
                 remote == message.remote for (remote, _) in self._active_exchanges
             )
             self.log.debug("Message to %s put into backlog", message.remote)
-            self._backlogs[message.remote].append((message, messageerror_monitor))
+            entry = (message, messageerror_monitor)
+            state["backlog_entry"] = entry
+            self._backlogs[message.remote].append(entry)
         else:
             self._send_initially(message, messageerror_monitor)
+
+        return send_canceller
+
+    def _make_send_canceller(self, message, messageerror_monitor):
+        """Build the cancellation state for an outgoing CON message.
+
+        The returned canceller represents the local interest in the message.
+        A request can be in one of three phases:
+
+        * *backlogged* -- the message has not touched the wire yet because
+          another CON exchange to the same remote is still open (NSTART).
+          Cancelling here is a hard revocation: the message is dropped from the
+          per-remote backlog, so it can neither be sent later nor hold the
+          congestion slot, and no retransmission timer ever exists for it.
+        * *in flight* -- the message was sent and its exchange is awaiting ACK
+          or RST with retransmission timers running. Cancelling only ends the
+          local wait; the exchange keeps running unchanged, because the remote
+          may already be acting on the (non-idempotent) command. Nothing in
+          CoAP allows unsending a datagram.
+        * *concluded* -- the exchange has already been removed. Cancelling is
+          a no-op.
+
+        Only the backlogged phase can guarantee that no remote side effect
+        happens. The monitor is wrapped so that a RST arriving after a local
+        cancellation no longer raises into an already abandoned request.
+        """
+
+        state = {"cancelled": False, "backlog_entry": None}
+
+        def guarded_monitor(state=state):
+            if not state["cancelled"]:
+                messageerror_monitor()
+
+        def send_canceller(state=state, message=message):
+            if state["cancelled"]:
+                return
+            state["cancelled"] = True
+
+            if self._active_exchanges is None:
+                # Shutdown already tore down all queues and timers; there is
+                # nothing left to detach from.
+                return
+
+            key = (message.remote, message.mid)
+            if key in self._active_exchanges:
+                # In flight: leave the exchange, its retransmission timer and
+                # the congestion slot untouched (the remote may have received
+                # the command already).
+                self.log.debug(
+                    "Local cancellation of %r does not stop its in-flight exchange",
+                    message,
+                )
+                return
+
+            entry = state["backlog_entry"]
+            if entry is not None:
+                backlog = self._backlogs.get(message.remote)
+                if backlog is not None and entry in backlog:
+                    self.log.debug(
+                        "Removing locally cancelled %r from backlog", message
+                    )
+                    backlog.remove(entry)
+                state["backlog_entry"] = None
+
+        return send_canceller, guarded_monitor, state
 
     def _send_initially(self, message, messageerror_monitor=None):
         """Put the message on the wire for the first time, starting retransmission timeouts"""

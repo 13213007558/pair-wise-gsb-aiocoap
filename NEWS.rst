@@ -2,6 +2,26 @@
   :copyright: SPDX-FileCopyrightText: Christian Amsüss
   :copyright: SPDX-License-Identifier: MIT
 
+Unreleased
+----------
+
+Fixes
+~~~~~
+
+* Cancelling a request now propagates into the unreliable transport's
+  per-remote NSTART wait queue.
+
+  A confirmable request that was still queued behind another in-flight
+  exchange to the same remote is removed from that queue, so it is no longer
+  transmitted once the preceding exchange receives its ACK.
+  Only this pre-transmission phase can be revoked with certainty: cancelling a
+  request whose CON message has already been sent merely ends the local wait,
+  while the exchange, its retransmissions and its congestion slot keep running
+  unchanged -- the remote side may already be acting on the (possibly
+  non-idempotent) command, and CoAP provides no way to unsend a datagram.
+  Cancelling a queued request never touches other requests, in-flight
+  exchanges or other remotes.
+
 Version 0.4.17
 --------------
 
